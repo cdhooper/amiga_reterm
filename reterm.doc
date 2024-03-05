@@ -1,0 +1,169 @@
+Starting reterm and connecting
+    reterm TCP:2000 -x NewShell CONSOLE: from S:Remote-Startup
+    reterm TCP:2000 -x
+
+    newshell TCP:2000
+    reterm -x
+
+    reterm TCP:2000 -x Util:Vim SYS:reterm/reterm.c
+
+
+    The easiest way to connect from Linux is by using telnet:
+        Amiga: DH0:> reterm TCP:2000
+        Linux: % telnet localhost 2000
+
+    You may use nc to connect from Linux, but must rely on exiting the Amiga
+    application to terminate the connection:
+        stty raw -echo onlcr && nc localhost 2000 ; stty sane
+
+    You can have stt configure the terminal differently which allows ^C to exit
+    nc, but this is probably not what you will want:
+        stty -icanon -echo && nc localhost 2000 ; stty sane
+
+    If you require proper display of extended characters such as glyphs
+    required in many European languages, the Amiga uses ISO-8859-1
+    (ECMA-94 Latin 1).  One way to get your Linux terminal to support this
+    encoding is to use luit.  Example:
+        luit -encoding ISO-8859-1 telnet localhost 2000 ; stty sane
+
+    If you are running a telnet or ssh daemon on your Amiga, you can start
+    reterm after connecting to the session.  Example
+        % telnet localhost 2000
+        Connected to localhost.
+        5.DH0:> reterm
+        Running: newshell CONSOLE:
+        New Shell process 6
+        6.DH0:> 
+
+Using editors inside reterm
+    For quick editing, AmigaDOS comes with ed.  To run it from a CLI,
+    use the "WINDOW CONSOLE:" argument.  Example:
+        ed WINDOW CONSOLE: my_file
+    Key bindings
+        ^A                     Next line
+        ^\ (control-backslash) Rudely abort ed
+
+    I personally use Vim on the Amiga:
+        http://aminet.net/package/text/edit/vim53bin
+        http://aminet.net/package/text/edit/vim53rt
+    Its use of the console device is supported by reterm, including dynamically
+    acquiring the current window rows and columns.
+
+Input and the command line
+    Some shells (csh for example) put the console in raw mode.  In this mode,
+    the shell handles all command editing.  In raw mode, reterm does minimal
+    processing of input characters, and mostly passes input directly through
+    to the application.  The exception is that telnet and xterm escape
+    sequences are captured and handled by reterm.  Most escape sequences are
+    converted by reterm to the Amiga console equivalent sequences, so that
+    the application will work as if it were interfacing with an Amiga console.
+
+    Shells which leave the reterm console in cooked mode (such as AmigaSHELL)
+    rely on the console handler to provide command line editing and other
+    features such as command history.  Reterm implements these features along
+    with tab completion for both command and file arguments.  See the Tab
+    Completion section for more details.
+    The following commands are understood by reterm in cooked mode:
+        ^\                        - Terminate the current read with zero bytes
+        ^A                        - Go to the beginning of the input line
+        ^B (Cursor Left)          - Move the input cursor left
+        ^D                        - Delete to the right or show tab completion
+        ^E (Shift-Cursor Right)   - Go to the end of the input line
+        ^F (Cursor Right)         - Move the input cursor right
+        ^H (Backspace)            - Delete input to left of the cursor
+        ^I (Tab)                  - Cycle to next tab completion
+        ^J (Linefeed)             - submit current input to Amiga application
+        ^K                        - Clear to end of line
+        ^M (Carriage Return)      - submit current input to Amiga application
+        ^N (Cursor Down)          - Next line in command history
+        ^P (Cursor Up)            - Previous line in command history
+        ^R                        - Redisplay input line
+        ^U                        - Clear to start of input line
+        ^W                        - Delete word
+        ^X                        - Clear entire input line
+        ^Y                        - Show command history
+        ^Z                        - Show command history
+        ^^ (Control-Cursor Left)  - Go to previous word in input line
+        ^_ (Control-Cursor Right) - Go to next word in input line
+           (Shift-Tab)            - Cycle to previous tab completion
+
+Tab completion
+    When run with a shell which requests cooked input, reterm implements
+    Tab Completion for commands and command arguments.  If you enter the
+    a partial first or last part of a command and press Tab, the first
+    completion will be shown.  Pressing Tab again will show the next match.
+    You may also use Shift-Tab to cycle in the reverse direction.  Using
+    Tab on the first word of a command line will cause reterm to search the
+    Path for an appropriate program to run, where using tab on the second
+    or subsequent words will cause reterm to search the current directory
+    (or another directory as specified).  Examples are below.
+    You enter (without pressing Return):
+        10.DH0:> list sys:tools/commodities/auto
+    and press Tab:
+        10.DH0:> list sys:Tools/Commodities/AutoPoint
+    and press Tab again:
+        10.DH0:> list sys:Tools/Commodities/AutoPoint.info
+    and press Tab again:
+        10.DH0:> list sys:tools/commodities/auto
+    as you can see from the above, it has cycled back to your original entry.
+
+    You enter (without pressing Return):
+        10.DH0:> vim
+    and press Tab:
+        10.DH0:> util:vim-5.3
+    and press Tab again:
+        10.DH0:> util:vim-6.0
+    and press Tab again:
+        10.DH0:> util:vim-6.4
+    and press Tab again:
+        10.DH0:> util:vim
+    In the above example, my startup does "assign util: sys:util" and
+    follows that with "path util: add" which adds this directory to my path.
+
+    You enter (without pressing Return):
+        10.DH0:> list t.info
+    and cursor left to the "." and press Tab:
+        10.DH0:> list Tools.info
+    and press Tab again:
+        10.DH0:> list Trashcan.info
+    and press Tab again:
+        10.DH0:> list t.info
+    The above is matching the "t" to the start of a filename and ".info" to
+    the end of the filename.
+
+    TAB COMPLETION HELPFUL HINTS
+    ----------------------------
+    When using Tab completion to descend into directories, a helpful hint
+    is to press ^E once you've reached the desired directory in the tab
+    completion cycle.  You can then press tab again to see entries within
+    that directory.
+
+    Once you've pressed Tab, you may press ^D to view all matching selections.
+    If your cursor is at the end of the current line, pressing ^D will also
+    show you matches to the entered command.  It's also a fast way to show the
+    current directory.  Example:
+        5.DH0> Type ^D
+    after ^D is pressed, you will see the following:
+          DPat              DW.config          History            PCD
+          SPat              SetFont            SetKeyboard        Shell-Startup
+          Startup-Sequence  bg                 fg                 fork
+        5.DH0> Type 
+
+Programmers
+    Source code to this program is provided under the terms of the GPL v2.
+    Reterm implements three asynchronous threads.  One (the runner thread)
+    runs only long enough to start the captive child application.  The captive
+    child may be a shell or a console application (such as vim).  Another
+    (the reader thread) handles acquiring user input and xterm responses,
+    providing that input back to the child application when it performs Read()
+    calls.  The third, and main thread initializes data structures, starts the
+    reader and runner threads, and then services console handler packets that
+    arrive from the captive child application.  Because the Amiga CLI
+    applications expect a console handler, the full set of console handler
+    packets must be implemented by Reterm's message loop.
+
+    ACTION_READ
+        When the application sends an ACTION_READ (DOS library Read() call),
+        the handler will queue this message to be handled by the reader thread.
+        The reader thread processes all input before placing it into the
+        application's read buffer.
