@@ -8,7 +8,7 @@
 #include <rexx/rexxio.h>
 
 static const char version[] =
-    "\0$VER: conperf 1.1 (10-Jul-2026) \xA9 Chris Hooper";
+    "\0$VER: conperf 1.2 (13-Jul-2026) \xA9 Chris Hooper";
 
 static const char usage[] =
     "\t-d  more details (verbose)\n"
@@ -25,6 +25,30 @@ void *argument = "";  // Generic test function argument
 #define STR_ESC "\x1b"
 #define STR_CSI "\x9b"
 
+/*
+ * Collect a terminal reply until its final byte shows up, the terminal goes
+ * quiet, or the buffer is full. Returns the number of bytes captured, which
+ * the caller still needs to validate.
+ */
+static LONG
+read_response(BPTR in, unsigned char *buf, size_t bufsize, unsigned char final)
+{
+    LONG len = 0;
+
+    while ((size_t) len < bufsize) {
+        if (WaitForChar(in, 500000) == FALSE)
+            break;
+        LONG got = Read(in, buf + len, bufsize - len);
+        if (got <= 0)
+            break;
+        len += got;
+        if (buf[len - 1] == final)
+            break;
+    }
+
+    return (len);
+}
+
 static BOOL
 test_window_bounds_report(int maxcount)
 {
@@ -39,12 +63,10 @@ test_window_bounds_report(int maxcount)
         LONG len = 0;
         Write(out, outbuf, sizeof (outbuf) - 1);
 
-        while (len < 11) {
-            /* Attempt to read the rest */
-            if (WaitForChar(in, 500000) == FALSE)
-                break;
-            len += Read(in, inbuf + len, sizeof (inbuf) - len);
-        }
+        /* Read until the terminating 'r' arrives: over a serial line the
+           reply trickles in, so a byte count is not a reliable stop
+           condition (a wide window makes it up to 14 bytes long). */
+        len = read_response(in, inbuf, sizeof (inbuf), 'r');
         if ((len < 11) || (len > 14) ||
             (strncmp(inbuf, STR_CSI "1;1;", 4) != 0) ||
             (inbuf[len - 1] != 'r')) {
@@ -86,12 +108,8 @@ test_device_status_report(int maxcount)
         LONG len = 0;
         Write(out, outbuf, sizeof (outbuf) - 1);
 
-        while (len < 5) {
-            /* Attempt to read the rest */
-            if (WaitForChar(in, 500000) == FALSE)
-                break;
-            len += Read(in, inbuf + len, sizeof (inbuf) - len);
-        }
+        /* Read until the terminating 'R' arrives (see above) */
+        len = read_response(in, inbuf, sizeof (inbuf), 'R');
         if ((len < 5) || (len > 6) ||
             ((inbuf[2] != ';') && (inbuf[3] != ';')) ||
             (inbuf[len - 1] != 'R')) {
