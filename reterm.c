@@ -39,7 +39,7 @@
 
 
 static const char version[] =
-    "\0$VER: reterm 1.1 (04-Mar-2022) © Chris Hooper";
+    "\0$VER: reterm " VER " ("__DATE__") \xA9 Chris Hooper";
 
 static const char usage[] =
     "\t-c <file>  Capture app input/output to file\n"
@@ -214,6 +214,7 @@ typedef struct {
     BOOL   nl_crlf;               // TRUE=Newline emits CRLF (FALSE=just LF)
     BOOL   stopping;              // Shutting down reader and message loop
     BOOL   reader_read_pending;   // Read from xterm console is pending
+    BOOL   tcp_readable;          // WaitSelect() reported socket readable
     BOOL   reader_close_FHs;      // Reader needs to close Filehandles at exit
     LONG   reader_timer_pending;  // Reader timer is active
     BOOL   xterm_request_pending; // App asked for cursor pos / screen size
@@ -281,6 +282,7 @@ warnx(const char *fmt, ...)
     vprintf(fmt, ap);
     va_end(ap);
     printf("\n");
+    fflush(stdout);
 }
 
 __attribute__((format(printf, 2, 3)))
@@ -1631,8 +1633,12 @@ process_pkt:
                 break;
             }
             case ACTION_WRITE:
-                if (glob->cmdline_len != 0) {
-                    /* Can not process packet at this time */
+                if ((glob->cmdline_len != 0) && (glob->stopping == FALSE)) {
+                    /*
+                     * Can not process packet at this time.  Once stopping,
+                     * the command line will never be completed, so the
+                     * write must instead fail below (else the app hangs).
+                     */
                     glob->pending_app_packet = Pkt;
                     return;
                 }
@@ -2760,6 +2766,13 @@ reader_handle_arrived_count(glob_t *glob, LONG count)
         return;
     }
 
+    if ((count == 0) && (glob->tcp_port != 0)) {
+        /* recv() of 0 bytes on a TCP socket means the remote closed */
+        DPRINT1("Remote closed connection");
+        glob->stopping = TRUE;
+        return;
+    }
+
     if (count == 0) {
         glob->got_zero_read_count++;  // Propagate to ACTION_READ
         if (glob->got_zero_read_count >= 3) {
@@ -2816,10 +2829,22 @@ send_Read(glob_t *glob)
         /* Get number of bytes waiting to be read */
         if (IoctlSocket(sock, FIONREAD, &avail) < 0) {
             warnx("ioctl(FIONREAD) failed");
+            glob->stopping = TRUE;
             return;
         }
-        if (avail == 0)
-            return;
+        if (avail == 0) {
+            /*
+             * If WaitSelect() reported the socket as readable, but there
+             * is no data, then the remote has closed the connection (or
+             * the socket has an error).  recv() will not block in that
+             * case, and is required to observe the EOF (0) or error (-1).
+             */
+            if (glob->tcp_readable == FALSE)
+                return;
+            glob->tcp_readable = FALSE;
+            avail = 1;
+        }
+        glob->tcp_readable = FALSE;
         if (space > avail) {
             space = avail;
         } else if (space < avail) {
@@ -4411,10 +4436,13 @@ do_WaitSelect(glob_t *glob, ULONG all_sigmask)
     struct timeval tv;
     tv.tv_sec  = 0;
     tv.tv_usec = 100000;
-    if (WaitSelect(sock + 1, &rdset, NULL, NULL, &tv, &signals) < 0) {
+    LONG rc = WaitSelect(sock + 1, &rdset, NULL, NULL, &tv, &signals);
+    if (rc < 0) {
         warnx("WaitSelect != 0");
         if (errno != EINTR)
             glob->stopping = TRUE;
+    } else if ((rc > 0) && FD_ISSET(sock, &rdset)) {
+        glob->tcp_readable = TRUE;
     }
     return (signals);
 }
@@ -4663,18 +4691,27 @@ break;
             reader_handle_timeouts(glob);
     }
 
-    while (1) {
-        /* Give child processes time to exit */
-        if ((glob->child_process_alive == FALSE) ||
-            (stop_count++ > 80))
-            break;
-
+    /*
+     * The application may still hold file handles which reference
+     * glob->app_cons_msgport.  That port must continue to be serviced
+     * (failing all I/O) until every handle has been closed.  Deleting it
+     * early would cause the application to hang (or crash) on its next
+     * console access.  Send break signals so that applications which are
+     * not doing console I/O will also notice and exit.
+     */
+    if (glob->open_count > 0)
+        signal_child(glob, SIGBREAKF_CTRL_C | SIGBREAKF_CTRL_D);
+    while ((glob->open_count > 0) || glob->runner_thread_alive) {
         /* Abort and fail any pending reads/waits (and pending WAIT timers) */
-        abort_read_queue(glob, glob->child_process_alive);
-        Delay(1);
-
+        abort_read_queue(glob, TRUE);
         handle_console_messages(glob);
+        if (++stop_count > 500)  // About 10 seconds
+            break;
+        Delay(1);
     }
+    DPRINT1("reader stop: open_count=%d runner=%d waited=%d",
+            glob->open_count, glob->runner_thread_alive, stop_count);
+    glob->child_process_alive = FALSE;
 
     /*
      * Clean up so the reader thread may exit.
@@ -4772,8 +4809,22 @@ fail_exit:
         DeleteMsgPort(timer_mp);
     if (xterm_timer_mp != NULL)
         DeleteMsgPort(xterm_timer_mp);
-    if (glob->app_cons_msgport != NULL)
-        DeleteMsgPort(glob->app_cons_msgport);
+    if (glob->app_cons_msgport != NULL) {
+        if ((glob->open_count > 0) || glob->runner_thread_alive) {
+            /*
+             * The application still has file handles referencing this
+             * port.  Deleting it would cause a crash or hang the next time
+             * the application performs console I/O, so it is leaked.
+             * Packets sent to it will no longer signal this (exiting) task.
+             */
+            warnx("Client %d app did not close console (%d open); "
+                  "leaking port", glob->client_number, glob->open_count);
+            glob->app_cons_msgport->mp_Flags   = PA_IGNORE;
+            glob->app_cons_msgport->mp_SigTask = NULL;
+        } else {
+            DeleteMsgPort(glob->app_cons_msgport);
+        }
+    }
 
     FreeSignal(wake_sigbit);
     if (tcp_read_sigbit != -1)
@@ -5005,13 +5056,22 @@ handle_connection(glob_t *glob_p, char *runner_cmd)
                       NP_ExitData, (ULONG) glob,
                       TAG_END);
 
-    /* Start the runner thread to execute the requested program */
-    CreateNewProcTags(NP_Entry, (ULONG) runner_thread,
-                      NP_Cli, TRUE,  // Create CLI struct (propagate path)
-                      NP_Name, (ULONG) runner_name,
-                      NP_StackSize, 2000,
-                      NP_ExitData, (ULONG) glob,
-                      TAG_END);
+    /*
+     * Start the runner thread to execute the requested program.
+     * runner_thread_alive is set before the runner starts so that the
+     * reader thread will not tear down the console message port while
+     * the runner is still starting the application.
+     */
+    glob->runner_thread_alive = TRUE;
+    if (CreateNewProcTags(NP_Entry, (ULONG) runner_thread,
+                          NP_Cli, TRUE,  // Create CLI struct (propagate path)
+                          NP_Name, (ULONG) runner_name,
+                          NP_StackSize, 2000,
+                          NP_ExitData, (ULONG) glob,
+                          TAG_END) == NULL) {
+        warnx("Failed to start runner");
+        glob->runner_thread_alive = FALSE;
+    }
 
     return (FALSE);
 }
