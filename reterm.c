@@ -942,16 +942,23 @@ task_window_kill(glob_t *glob, UBYTE cmd)
             (((gtype & GTYP_GTYPEMASK) == GTYP_CUSTOMGADGET) ||
              ((gtype & GTYP_GTYPEMASK) == GTYP_BOOLGADGET))) {
             struct IntuiText *it = gadget->GadgetText;
-            UBYTE  buf[80];
+            UBYTE  buf[96];  // Max 84: 16 + 65 + CR LF NUL
 
             if (glob->requester_abort_active == FALSE) {
                 UBYTE *str;
                 UBYTE buf2[80];
 show_selected:
-                if (gadget->Flags & GFLG_LABELSTRING)
-                    str = (UBYTE *) gadget->GadgetText;
-                else
-                    str = (it != NULL) ? it->IText : NULL;
+                switch (gadget->Flags & GFLG_LABELMASK) {
+                    case GFLG_LABELSTRING:
+                        str = (UBYTE *) gadget->GadgetText;
+                        break;
+                    case GFLG_LABELITEXT:
+                        str = (it != NULL) ? it->IText : NULL;
+                        break;
+                    default:  // GFLG_LABELIMAGE: GadgetText is an Image
+                        str = NULL;
+                        break;
+                }
 
                 if (str == NULL) {
                     str = buf2;
@@ -969,13 +976,15 @@ show_selected:
             gadget_count++;
         } else {
             struct IntuiText *it = gadget->GadgetText;
-            UBYTE  buf[80];
+            UBYTE  buf[96];  // Max 84: 16 + 65 + CR LF NUL
             UBYTE *str;
-            if (gadget->Flags & GFLG_LABELSTRING)
+            if ((gadget->Flags & GFLG_LABELMASK) == GFLG_LABELSTRING)
                 str = (UBYTE *) gadget->GadgetText;
+            else if (((gadget->Flags & GFLG_LABELMASK) == GFLG_LABELITEXT) &&
+                     (it != NULL) && (it->IText != NULL))
+                str = it->IText;
             else
-                str = ((it != NULL) && (it->IText != NULL)) ? it->IText :
-                                                              (UBYTE *)"";
+                str = (UBYTE *) "";
             sprintf(buf, "    ?) ID=%d %.65s\r\n", gadget->GadgetID, str);
         }
     }
@@ -2741,6 +2750,15 @@ tab_completion_initiate(glob_t *glob, int direction)
     len_new = strlen(name);
 
     diff = len_new - len_old;
+    if (glob->cmdline_len + diff > sizeof (glob->cmdline) - 1) {
+        /*
+         * Completion would not fit in the command line buffer (one byte
+         * is reserved for the newline added on Enter).  Leave the command
+         * line as is; the next tab will move on to the next name.
+         */
+        xterm_console_emit(glob, "\a", 1);
+        goto finish_initiate;
+    }
     memmove(glob->cmdline + spos + len_new,
             glob->cmdline + spos + len_old,
             glob->cmdline_len - len_old - spos);
@@ -3115,6 +3133,7 @@ static BOOL
 history_fetch(glob_t *glob, UBYTE *cmd, int line_num)
 {
     UBYTE *ptr = history_char_prev(glob, glob->history_cur);
+    UBYTE *cmd_end;
 
     if (line_num == 0) {
         /* Blank input line */
@@ -3140,8 +3159,11 @@ history_fetch(glob_t *glob, UBYTE *cmd, int line_num)
         if (*ptr == '\0')
             return (FALSE);  /* No previous history */
 
+        /* All callers supply a buffer of sizeof (glob->cmdline) */
+        cmd_end = cmd + sizeof (glob->cmdline) - 1;
         do {
-            *(cmd++) = *ptr;
+            if (cmd < cmd_end)
+                *(cmd++) = *ptr;
             ptr = history_char_next(glob, ptr);
         } while (*ptr != '\0');
         *cmd = '\0';
@@ -3696,7 +3718,7 @@ update_input_line:
                                                    glob->cmdline_pos + 1);
             } else {
                 /* Use cursor left */
-                UBYTE tbuf[8];
+                UBYTE tbuf[16];
                 int left;
                 if (glob->cmdline_pos > 0)
                     xterm_console_emit(glob, tbuf,
@@ -3782,7 +3804,7 @@ update_input_line:
                 xterm_console_emit_rep(glob, '\b', glob->cmdline_len);
             } else {
                 /* Use cursor left and erase to end of line */
-                UBYTE tbuf[8];
+                UBYTE tbuf[16];
                 xterm_console_emit(glob, tbuf,
                         sprintf(tbuf, STR_ESC "[%uD" STR_ESC "[K",
                                 glob->cmdline_pos));
