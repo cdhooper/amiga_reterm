@@ -203,6 +203,7 @@ typedef struct {
     BOOL   support_telnet;        // Enable telnet protocol negotiation
     BOOL   disable_telnet;        // Disable telnet protocol negotiation
     BOOL   support_utf8;          // Convert to/from xterm UTF-8
+    UBYTE  utf8_lead;             // Pending UTF-8 lead byte (0xc2 or 0xc3)
     BOOL   tab_comp_no_exec_path; // don't show program path on tab
     BOOL   capture_input;         // Capture input to file
     BOOL   capture_output;        // Capture output to file
@@ -211,6 +212,7 @@ typedef struct {
     BOOL   runner_thread_alive;   // TRUE=Runner thread still running (stuck?)
     BOOL   child_process_alive;   // TRUE=Child application still running
     BOOL   got_zero_read_count;   // Propagate "end of file" to application
+    UBYTE  device_eof_count;      // Consecutive 0-length reads from device
     BOOL   nl_crlf;               // TRUE=Newline emits CRLF (FALSE=just LF)
     BOOL   stopping;              // Shutting down reader and message loop
     BOOL   reader_read_pending;   // Read from xterm console is pending
@@ -669,28 +671,146 @@ getnum(const char *buf, int *num)
     return (pos);
 }
 
-static void
-xterm_console_emit(glob_t *glob, const UBYTE *buf, LONG len)
+/*
+ * tcp_wait_writable() waits for the (non-blocking) reader socket to have
+ *                     send buffer space.  It returns FALSE if reterm is
+ *                     stopping, in which case the caller should give up.
+ *                     The wait is interruptible by stop_readers().
+ */
+static BOOL
+tcp_wait_writable(glob_t *glob)
 {
-    if ((glob->capture_XFH != 0) && glob->capture_output)
-        Write(glob->capture_XFH, (UBYTE *) buf, len);
+    struct Library *SocketBase = glob->socketbase_reader;
+    LONG            sock       = glob->tcp_socket_reader;
 
+    while (glob->stopping == FALSE) {
+        fd_set         wrset;
+        struct timeval tv;
+        ULONG          signals = glob->reader_wake_signal;
+        LONG           rc;
+
+        FD_ZERO(&wrset);
+        FD_SET(sock, &wrset);
+        tv.tv_sec  = 1;
+        tv.tv_usec = 0;
+        rc = WaitSelect(sock + 1, NULL, &wrset, NULL, &tv, &signals);
+        if (rc < 0) {
+            if (Errno() == EINTR)
+                continue;
+            glob->stopping = TRUE;
+            break;
+        }
+        if ((rc > 0) && FD_ISSET(sock, &wrset))
+            return (TRUE);
+    }
+    return (FALSE);
+}
+
+/*
+ * xterm_console_emit_raw() sends bytes to the remote terminal exactly as
+ *                          given (no telnet IAC escaping, no capture).
+ */
+static void
+xterm_console_emit_raw(glob_t *glob, const UBYTE *buf, LONG len)
+{
     if (glob->tcp_port != 0) {
-        /* TCP socket */
+        /* TCP socket (non-blocking) */
         LONG            sock       = glob->tcp_socket_reader;
         struct Library *SocketBase = glob->socketbase_reader;
         while ((len > 0) && (SocketBase != NULL) && (sock >= 0)) {
-            int count = send(sock, (UBYTE *)buf, len, 0);
+            LONG count = send(sock, (UBYTE *)buf, len, 0);
             if (count < 0) {
+                LONG error = Errno();
+                if (((error == EWOULDBLOCK) || (error == EINTR)) &&
+                    tcp_wait_writable(glob)) {
+                    continue;  // Remote is slow; retry
+                }
                 glob->stopping = TRUE;
                 break;
             }
+            buf += count;
             len -= count;
         }
     } else {
         /* Amiga device */
         Write(glob->reader_OFH, (UBYTE *) buf, len);
     }
+}
+
+/*
+ * telnet_emit() sends a telnet protocol command (which begins with IAC)
+ *               to the remote.  It must not be IAC-escaped.
+ */
+static void
+telnet_emit(glob_t *glob, const UBYTE *buf, LONG len)
+{
+    if ((glob->capture_XFH != 0) && glob->capture_output)
+        Write(glob->capture_XFH, (UBYTE *) buf, len);
+    xterm_console_emit_raw(glob, buf, len);
+}
+
+/*
+ * xterm_console_emit() sends data to the remote terminal.  When the telnet
+ *                      protocol is active, any data byte of 0xff must be
+ *                      sent as IAC IAC (RFC-854), or the remote will
+ *                      interpret it and following bytes as a telnet command.
+ */
+static void
+xterm_console_emit(glob_t *glob, const UBYTE *buf, LONG len)
+{
+    static const UBYTE iac_iac[] = {TELNET_IAC, TELNET_IAC};
+    LONG pos;
+    LONG spos = 0;
+
+    if ((glob->capture_XFH != 0) && glob->capture_output)
+        Write(glob->capture_XFH, (UBYTE *) buf, len);
+
+    if (glob->support_telnet == FALSE) {
+        xterm_console_emit_raw(glob, buf, len);
+        return;
+    }
+
+    for (pos = 0; pos < len; pos++) {
+        if (buf[pos] != TELNET_IAC)
+            continue;
+        if (pos != spos)
+            xterm_console_emit_raw(glob, buf + spos, pos - spos);
+        xterm_console_emit_raw(glob, iac_iac, sizeof (iac_iac));
+        spos = pos + 1;
+    }
+    if (pos != spos)
+        xterm_console_emit_raw(glob, buf + spos, pos - spos);
+}
+
+/*
+ * xterm_console_emit_text() sends ISO 8859-1 text (such as the user's
+ *                           command line) to the remote terminal, converting
+ *                           to UTF-8 if enabled.  Latin-1 0xa0-0xff is
+ *                           U+00A0-U+00FF, which is a two-byte sequence.
+ */
+static void
+xterm_console_emit_text(glob_t *glob, const UBYTE *buf, LONG len)
+{
+    LONG pos;
+    LONG spos = 0;
+
+    if (glob->support_utf8 == FALSE) {
+        xterm_console_emit(glob, buf, len);
+        return;
+    }
+    for (pos = 0; pos < len; pos++) {
+        UBYTE tbuf[2];
+        if (buf[pos] < 0xa0)
+            continue;
+        if (pos != spos)
+            xterm_console_emit(glob, buf + spos, pos - spos);
+        tbuf[0] = 0xc0 | (buf[pos] >> 6);
+        tbuf[1] = 0x80 | (buf[pos] & 0x3f);
+        xterm_console_emit(glob, tbuf, sizeof (tbuf));
+        spos = pos + 1;
+    }
+    if (pos != spos)
+        xterm_console_emit(glob, buf + spos, pos - spos);
 }
 
 /*
@@ -1393,14 +1513,12 @@ xterm_cons_text_write(glob_t *glob, UBYTE *buf, size_t count)
                 case 0x8d:  /* Reverse index - Move up one line */
                     xterm_console_emit(glob, STR_ESC "M", 2);
                     goto go_next;
-                case 0xa0 ... 0xff: {
+                case 0xa0 ... 0xff:
                     if (glob->support_utf8) {
-                        UBYTE tbuf[] = {0xc2, buf[0]};
-                        xterm_console_emit(glob, tbuf, sizeof (tbuf));
+                        xterm_console_emit_text(glob, buf, 1);
                         goto go_next;
                     }
                     break;
-                }
             }
         }
         xterm_console_emit(glob, buf, pos);
@@ -1516,6 +1634,7 @@ abort_read_queue(glob_t *glob, BOOL do_packet_reply)
         Pkt = PktFromMsg(Msg);
 
         if (Pkt->dp_Type == ACTION_WAIT_CHAR) {
+            Pkt->dp_Res1 = glob->stopping ? DOSTRUE : DOSFALSE;
             /* Cancel pending timer */
             struct timerequest *t_req = (struct timerequest *) Pkt->dp_Res2;
             if (t_req != NULL) {
@@ -1541,7 +1660,8 @@ abort_read_queue(glob_t *glob, BOOL do_packet_reply)
             warnx("Unknown read queue pkt %d", Pkt->dp_Type);
             do_packet_reply = FALSE;
         }
-        Pkt->dp_Res1 = DOSFALSE;
+        if (Pkt->dp_Type != ACTION_WAIT_CHAR)
+            Pkt->dp_Res1 = DOSFALSE;
 
         /* Remove entry from read wait list */
         RemHead(&glob->pending_reads);
@@ -1693,8 +1813,16 @@ process_pkt:
 
                 DPRINT1("WAIT_CHAR %d", usecs);
                 DPRINT2("WaitChar(ARG=%d)", usecs);
-                if (glob->stopping)
+                if (glob->stopping) {
+                    /*
+                     * Report input "available" so that an application
+                     * polling WaitForChar() will Read() and see the error,
+                     * rather than poll forever.
+                     */
+                    Res1 = DOSTRUE;
+                    Res2 = 1;
                     break;
+                }
 
                 if (reader_consume(glob, NULL, 0)) {  // NULL means just check
                     DPRINT("=Y\n");
@@ -2105,7 +2233,7 @@ tab_completion_show_names(glob_t *glob)
             }
         }
         xterm_console_emit_rep(glob, ' ', numspaces);
-        xterm_console_emit(glob, node->name, namelen);
+        xterm_console_emit_text(glob, node->name, namelen);
     }
     if (glob->no_cooked_esc_sequences) {
         xterm_console_emit(glob, "\r\n", 2);
@@ -2624,8 +2752,8 @@ tab_completion_initiate(glob_t *glob, int direction)
         /* Move cursor to spos */
         xterm_console_emit_rep(glob, '\b', glob->cmdline_pos - spos);
         /* Emit new cmdline */
-        xterm_console_emit(glob, glob->cmdline + spos,
-                           glob->cmdline_len - spos);
+        xterm_console_emit_text(glob, glob->cmdline + spos,
+                                glob->cmdline_len - spos);
 
         if (diff < 0) {
             /* Overwrite the old end of line */
@@ -2661,7 +2789,7 @@ tab_completion_initiate(glob_t *glob, int direction)
         xterm_console_emit(glob, tbuf, strlen(tbuf));
 
         /* Output updated text */
-        xterm_console_emit(glob, glob->cmdline + spos, len_new);
+        xterm_console_emit_text(glob, glob->cmdline + spos, len_new);
 
         /* Adjust cursor position */
         glob->cmdline_pos = glob->tab_comp_epos + cursor_adjust;
@@ -2774,13 +2902,21 @@ reader_handle_arrived_count(glob_t *glob, LONG count)
     }
 
     if (count == 0) {
+        /*
+         * Device (e.g. TCP: handler) reported end of file.  Propagate it
+         * to the application, but track consecutive occurrences separately
+         * from user-generated EOF (^\ or telnet EOF) so that an
+         * application which consumes each EOF and reads again can not
+         * prevent reterm from noticing that the device has closed.
+         */
         glob->got_zero_read_count++;  // Propagate to ACTION_READ
-        if (glob->got_zero_read_count >= 3) {
+        if (++glob->device_eof_count >= 3) {
             warnx("Too many zero-length reads -- exiting reterm");
             glob->stopping = TRUE;
         }
         return;
     }
+    glob->device_eof_count = 0;
 
     if ((glob->capture_XFH != 0) && glob->capture_input) {
         Write(glob->capture_XFH, "{", 1);
@@ -2853,6 +2989,9 @@ send_Read(glob_t *glob)
         }
 
         count = recv(sock, ptr, space, 0);
+        if ((count < 0) &&
+            ((Errno() == EWOULDBLOCK) || (Errno() == EINTR)))
+            return;  // No data after all (socket is non-blocking)
         if (count > space) {
             count = space;
             warnx("reterm recv(%d) returned %d bytes", space, count);
@@ -3086,7 +3225,7 @@ history_show(glob_t *glob)
             }
             xterm_console_emit(glob, tbuf, sprintf(tbuf, "%4d: ", cur_line++));
             while (*ptr != '\0') {
-                    xterm_console_emit(glob, ptr, 1);
+                    xterm_console_emit_text(glob, ptr, 1);
                 ptr = history_char_next(glob, ptr);
                 if (ptr == glob->history_cur) {
                     xterm_console_emit(glob, "\r\n", 2);
@@ -3427,8 +3566,8 @@ xterm_cook_app_input(glob_t *glob, UBYTE cmd)
             num = glob->cmdline_len - glob->cmdline_pos;
             if (glob->no_cooked_esc_sequences || (num < 3)) {
                 /* Emit command line text to go forward */
-                xterm_console_emit(glob, glob->cmdline + glob->cmdline_pos,
-                                   num);
+                xterm_console_emit_text(glob, glob->cmdline + glob->cmdline_pos,
+                                        num);
             } else {
                 /* Use cursor right */
                 UBYTE tbuf[8];
@@ -3439,7 +3578,8 @@ xterm_cook_app_input(glob_t *glob, UBYTE cmd)
             break;
         case 0x06:  // ^F - Cursor right
             if (glob->cmdline_pos < glob->cmdline_len) {
-                xterm_console_emit(glob, glob->cmdline + glob->cmdline_pos, 1);
+                xterm_console_emit_text(glob,
+                                        glob->cmdline + glob->cmdline_pos, 1);
                 glob->cmdline_pos++;
             }
             return;
@@ -3454,9 +3594,9 @@ xterm_cook_app_input(glob_t *glob, UBYTE cmd)
             glob->cmdline_pos--;
             glob->cmdline_len--;
             if (glob->no_cooked_esc_sequences) {
-                xterm_console_emit(glob, &cmd, 1);
-                xterm_console_emit(glob, glob->cmdline + glob->cmdline_pos,
-                                   glob->cmdline_len - glob->cmdline_pos);
+                xterm_console_emit_text(glob, &cmd, 1);
+                xterm_console_emit_text(glob, glob->cmdline + glob->cmdline_pos,
+                                        glob->cmdline_len - glob->cmdline_pos);
                 xterm_console_emit(glob, " ", 1);
                 xterm_console_emit_rep(glob, '\b',
                                        glob->cmdline_len -
@@ -3517,7 +3657,7 @@ update_input_line:
                         sprintf(tbuf, STR_ESC "[%uD", glob->cmdline_pos));
             }
 
-            xterm_console_emit(glob, glob->cmdline, num);  // Emit new line
+            xterm_console_emit_text(glob, glob->cmdline, num);  // Emit new line
             if (glob->no_cooked_esc_sequences) {
                 /* Space to end of old line and then backspace */
                 if (glob->cmdline_len > num) {
@@ -3550,7 +3690,7 @@ update_input_line:
         case 0x12:  // ^R - Redraw command line
             if (glob->no_cooked_esc_sequences) {
                 xterm_console_emit_rep(glob, '\b', glob->cmdline_pos);
-                xterm_console_emit(glob, glob->cmdline, glob->cmdline_len);
+                xterm_console_emit_text(glob, glob->cmdline, glob->cmdline_len);
                 xterm_console_emit(glob, " ", 1);
                 xterm_console_emit_rep(glob, '\b', glob->cmdline_len -
                                                    glob->cmdline_pos + 1);
@@ -3561,7 +3701,7 @@ update_input_line:
                 if (glob->cmdline_pos > 0)
                     xterm_console_emit(glob, tbuf,
                             sprintf(tbuf, STR_ESC "[%uD", glob->cmdline_pos));
-                xterm_console_emit(glob, glob->cmdline, glob->cmdline_len);
+                xterm_console_emit_text(glob, glob->cmdline, glob->cmdline_len);
 
                 left = glob->cmdline_len - glob->cmdline_pos;
                 if (left < 4) {
@@ -3584,7 +3724,7 @@ update_input_line:
             num = glob->cmdline_len - glob->cmdline_pos;
             memmove(glob->cmdline, glob->cmdline + glob->cmdline_pos, num);
             xterm_console_emit_rep(glob, '\b', glob->cmdline_pos);
-            xterm_console_emit(glob, glob->cmdline, num);
+            xterm_console_emit_text(glob, glob->cmdline, num);
             xterm_console_emit_rep(glob, ' ', glob->cmdline_len - num);
             xterm_console_emit_rep(glob, '\b', glob->cmdline_len);
             glob->cmdline_pos = 0;
@@ -3618,8 +3758,8 @@ update_input_line:
             if (glob->no_cooked_esc_sequences) {
                 /* Use backspace, partial cmdline, space, backspace */
                 xterm_console_emit_rep(glob, '\b', remlen);
-                xterm_console_emit(glob, glob->cmdline + glob->cmdline_pos,
-                                   tailen);
+                xterm_console_emit_text(glob, glob->cmdline + glob->cmdline_pos,
+                                        tailen);
                 xterm_console_emit_rep(glob, ' ', remlen);
                 xterm_console_emit_rep(glob, '\b', remlen + tailen);
             } else {
@@ -3654,7 +3794,7 @@ update_input_line:
             if (glob->no_cooked_esc_sequences) {
                 xterm_console_emit(glob, "\r\n", 2);
                 history_show(glob);
-                xterm_console_emit(glob, glob->cmdline, glob->cmdline_len);
+                xterm_console_emit_text(glob, glob->cmdline, glob->cmdline_len);
                 num = glob->cmdline_len - glob->cmdline_pos;
                 xterm_console_emit_rep(glob, '\b', num);
             } else {
@@ -3724,8 +3864,8 @@ update_input_line:
             diff = newpos - glob->cmdline_pos;
             if (glob->no_cooked_esc_sequences || (diff < 5)) {
                 /* Emit cmdline text */
-                xterm_console_emit(glob, glob->cmdline + glob->cmdline_pos,
-                                   diff);
+                xterm_console_emit_text(glob, glob->cmdline + glob->cmdline_pos,
+                                        diff);
             } else {
                 /* Use cursor right */
                 UBYTE tbuf[8];
@@ -3749,8 +3889,8 @@ update_input_line:
             glob->cmdline[glob->cmdline_pos] = cmd;
             glob->cmdline_len++;
             if (glob->no_cooked_esc_sequences) {
-                xterm_console_emit(glob, glob->cmdline + glob->cmdline_pos,
-                                   glob->cmdline_len - glob->cmdline_pos);
+                xterm_console_emit_text(glob, glob->cmdline + glob->cmdline_pos,
+                                        glob->cmdline_len - glob->cmdline_pos);
                 glob->cmdline_pos++;
                 if (glob->cmdline_len > glob->cmdline_pos) {
                     xterm_console_emit_rep(glob, '\b',
@@ -3760,11 +3900,11 @@ update_input_line:
             } else {
                 glob->cmdline_pos++;
                 if (glob->cmdline_pos == glob->cmdline_len) {
-                    xterm_console_emit(glob, &cmd, 1);
+                    xterm_console_emit_text(glob, &cmd, 1);
                 } else {
                     /* Insert space before emitting character */
-                    const UBYTE tbuf[] = {KEY_ESC, '[', '@', cmd};
-                    xterm_console_emit(glob, tbuf, sizeof (tbuf));
+                    xterm_console_emit(glob, STR_ESC "[@", 3);
+                    xterm_console_emit_text(glob, &cmd, 1);
                 }
             }
             break;
@@ -3992,8 +4132,20 @@ reader_process_xterm_to_amiga(glob_t *glob)
             glob->unproc_spos = 0;
 
         switch (glob->xta_mode) {
-            case XT_MODE_NONE:
+            case XT_MODE_NONE: {
+                BOOL utf8_decoded = FALSE;
+
                 tab_completion_handle(glob);
+                if (glob->utf8_lead != 0) {
+                    /* Second byte of a UTF-8 sequence U+0080 - U+00FF */
+                    UBYTE lead = glob->utf8_lead;
+                    glob->utf8_lead = 0;
+                    if ((cmd & 0xc0) == 0x80) {
+                        cmd = (UBYTE) (((lead & 0x03) << 6) | (cmd & 0x3f));
+                        utf8_decoded = TRUE;
+                    }
+                    /* else invalid sequence: lead is dropped */
+                }
                 if (glob->requester_abort_active &&
                     task_window_kill(glob, cmd)) {
                     break;  // Input was absorbed
@@ -4001,6 +4153,14 @@ reader_process_xterm_to_amiga(glob_t *glob)
                 if ((cmd == glob->requester_abort_key) &&
                     task_window_kill(glob, cmd)) {
                     break;  // Input was absorbed
+                }
+                if (utf8_decoded) {
+                    /*
+                     * Decoded character is literal ISO 8859-1 text.  It must
+                     * not be interpreted below (e.g. 0xff as telnet IAC,
+                     * 0x9b as CSI, or 0xc2 as another UTF-8 lead byte).
+                     */
+                    goto pass_through;
                 }
 
                 switch (cmd) {
@@ -4039,9 +4199,13 @@ reader_process_xterm_to_amiga(glob_t *glob)
                     case 0x7f:  // xterm Backspace
                         cmd = '\b';
                         break;
-                    case 0xc2:  // UTF-8 escape for ECMA-94 ISO 8859-1
-                        if (glob->support_utf8)
-                            continue;  // Ignore escape to Latin-1 on input
+                    case 0xc2:  // UTF-8 lead for U+0080 - U+00BF
+                    case 0xc3:  // UTF-8 lead for U+00C0 - U+00FF
+                        if (glob->support_utf8) {
+                            /* Combine with next byte to form ISO 8859-1 */
+                            glob->utf8_lead = cmd;
+                            continue;
+                        }
                         break;
                     case TELNET_IAC:
                         if (glob->support_telnet) {
@@ -4058,6 +4222,7 @@ pass_through:
                 else
                     xterm_cook_app_input(glob, cmd);
                 break;
+            }
             case XT_MODE_ESC:
                 xterm_timer_cancel(glob);
                 switch (cmd) {
@@ -4113,6 +4278,11 @@ pass_through:
                 }
                 break;
             case XT_MODE_IAC:
+                /*
+                 * Most telnet commands are a single byte following IAC.
+                 * Those which take an option byte set a new mode below.
+                 */
+                glob->xta_mode = XT_MODE_NONE;
                 switch (cmd) {
                     case TELNET_EOF:    // 0xec - Enf of file (EOF)
                         glob->got_zero_read_count++;
@@ -4154,19 +4324,19 @@ pass_through:
                 DPRINT("WILL %02x\n", cmd);
                 if (cmd == TELNET_OP_LINEMODE) {
                     UBYTE tbuf[] = {TELNET_IAC, TELNET_DO, cmd};
-                    xterm_console_emit(glob, tbuf, sizeof (tbuf));
+                    telnet_emit(glob, tbuf, sizeof (tbuf));
                     DPRINT(" DO   %02x\n", cmd);
                     glob->did_telnet_do_linemode = TRUE;
                 } else if (cmd == TELNET_OP_NO_GO_AHEAD) {
                     if (glob->did_telnet_no_go_ahead == FALSE) {
                         glob->did_telnet_no_go_ahead = TRUE;
                         UBYTE tbuf[] = {TELNET_IAC, TELNET_DO, cmd};
-                        xterm_console_emit(glob, tbuf, sizeof (tbuf));
+                        telnet_emit(glob, tbuf, sizeof (tbuf));
                         DPRINT(" DO   %02x\n", cmd);
                     }
                 } else {
                     UBYTE tbuf[] = {TELNET_IAC, TELNET_DONT, cmd};
-                    xterm_console_emit(glob, tbuf, sizeof (tbuf));
+                    telnet_emit(glob, tbuf, sizeof (tbuf));
                     DPRINT(" DONT %02x\n", cmd);
                 }
                 glob->xta_mode = XT_MODE_NONE;
@@ -4175,7 +4345,7 @@ pass_through:
                 DPRINT("WONT %02x\n", cmd);
                 if (cmd == TELNET_OP_ECHO) {
                     UBYTE tbuf[] = {TELNET_IAC, TELNET_WILL, cmd};
-                    xterm_console_emit(glob, tbuf, sizeof (tbuf));
+                    telnet_emit(glob, tbuf, sizeof (tbuf));
                     DPRINT(" WILL %02x\n", cmd);
                 }
                 glob->xta_mode = XT_MODE_NONE;
@@ -4187,15 +4357,15 @@ pass_through:
                 if (cmd == TELNET_OP_ECHO)
                     glob->did_telnet_will_echo = TRUE;
 
-                xterm_console_emit(glob, tbuf, sizeof (tbuf));
+                telnet_emit(glob, tbuf, sizeof (tbuf));
 
                 DPRINT("DO %02x\n", cmd);
                 DPRINT(" %s %02x\n",
-                       (tbuf[1] = TELNET_WILL) ? "WILL" : "WONT", cmd);
+                       (tbuf[1] == TELNET_WILL) ? "WILL" : "WONT", cmd);
                 if (cmd == TELNET_OP_NO_GO_AHEAD) {
                     tbuf[1] = TELNET_WILL;
                     tbuf[2] = TELNET_OP_ECHO;
-                    xterm_console_emit(glob, tbuf, sizeof (tbuf));
+                    telnet_emit(glob, tbuf, sizeof (tbuf));
                     DPRINT(" WILL %02x\n", TELNET_OP_ECHO);
                 }
                 glob->xta_mode = XT_MODE_NONE;
@@ -4214,7 +4384,7 @@ pass_through:
                     glob->xta_mode = XT_MODE_NONE;
                     break;
                 }
-                xterm_console_emit(glob, tbuf, sizeof (tbuf));
+                telnet_emit(glob, tbuf, sizeof (tbuf));
                 DPRINT(" WONT %02x\n", cmd);
                 glob->xta_mode = XT_MODE_NONE;
                 break;
@@ -4426,8 +4596,22 @@ do_WaitSelect(glob_t *glob, ULONG all_sigmask)
     /* TCP Socket */
     fd_set rdset;
     LONG sock = glob->tcp_socket_reader;
+    LONG nfds = sock + 1;
+    LONG space = (LONG) glob->unproc_spos - (LONG) glob->unproc_epos - 1;
     FD_ZERO(&rdset);
-    FD_SET(sock, &rdset);
+    if (space < 0)
+        space += sizeof (glob->unproc_buf);
+    if (space > 0) {
+        FD_SET(sock, &rdset);
+    } else {
+        /*
+         * No room to receive data, so don't wait for the socket to become
+         * readable (it already is, so that would just spin).  Processing
+         * resumes when the application consumes input (signal) or on the
+         * timeout below.
+         */
+        nfds = 0;
+    }
     signals = all_sigmask;
     /*
      * We need a timeout (must poll) because FS-UAE doesn't yet
@@ -4436,11 +4620,13 @@ do_WaitSelect(glob_t *glob, ULONG all_sigmask)
     struct timeval tv;
     tv.tv_sec  = 0;
     tv.tv_usec = 100000;
-    LONG rc = WaitSelect(sock + 1, &rdset, NULL, NULL, &tv, &signals);
+    LONG rc = WaitSelect(nfds, &rdset, NULL, NULL, &tv, &signals);
     if (rc < 0) {
-        warnx("WaitSelect != 0");
-        if (errno != EINTR)
+        LONG error = Errno();
+        if (error != EINTR) {
+            warnx("WaitSelect failed: %d", error);
             glob->stopping = TRUE;
+        }
     } else if ((rc > 0) && FD_ISSET(sock, &rdset)) {
         glob->tcp_readable = TRUE;
     }
@@ -4557,6 +4743,19 @@ reader_thread(register char *arg, register long len)
             warnx("Failed to obtain reader socket");
             goto fail_exit;
         }
+        {
+            /*
+             * Keepalive allows a dead peer (no FIN/RST) to eventually be
+             * detected.  Non-blocking I/O allows a stalled send() to be
+             * interrupted when reterm is stopping.
+             */
+            LONG one = 1;
+            if (setsockopt(glob->tcp_socket_reader, SOL_SOCKET, SO_KEEPALIVE,
+                           &one, sizeof (one)) < 0)
+                warnx("setsockopt(SO_KEEPALIVE) failed: %d", Errno());
+            if (IoctlSocket(glob->tcp_socket_reader, FIONBIO, &one) < 0)
+                warnx("ioctl(FIONBIO) failed: %d", Errno());
+        }
         tcp_read_sigbit = AllocSignal(-1);
         if (tcp_read_sigbit < 0)
             goto fail_exit;
@@ -4599,7 +4798,7 @@ reader_thread(register char *arg, register long len)
     if (glob->support_telnet && !glob->did_telnet_linemode) {
         const UBYTE tbuf[] = {TELNET_IAC, TELNET_DO, TELNET_OP_LINEMODE};
         DPRINT(" DO %02x\n", tbuf[2]);
-        xterm_console_emit(glob, tbuf, sizeof (tbuf));
+        telnet_emit(glob, tbuf, sizeof (tbuf));
         glob->did_telnet_linemode = TRUE;
     }
 #if 0
@@ -5415,7 +5614,7 @@ handle_capture:
             socklen_t len = sizeof (addr);
             LONG sock = accept(master_sock, (struct sockaddr *) &addr, &len);
             if (sock < 0) {
-                warnx("socket accept failed: %d", errno);
+                warnx("socket accept failed: %d", Errno());
                 break;
             }
             glob->client_number++;
