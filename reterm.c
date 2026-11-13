@@ -14,6 +14,7 @@
 #include <exec/exec.h>
 #include <exec/types.h>
 #include <exec/memory.h>
+#include <exec/execbase.h>
 #include <dos/dosextens.h>
 #include <dos/dostags.h>
 #include <dos/exall.h>
@@ -42,6 +43,8 @@ static const char version[] =
     "\0$VER: reterm " VER " ("__DATE__") \xA9 Chris Hooper";
 
 static const char usage[] =
+    "\t-a         List abandoned console ports (programs left by a reterm)\n"
+    "\t-A <cli>   Attach to the abandoned console of CLI process <cli>\n"
     "\t-c <file>  Capture app input/output to file\n"
     "\t-C <file>  Capture xterm input/output to file\n"
     "\t-d <count> Daemon mode (cnt = simultaneous daemons)\n"
@@ -190,6 +193,16 @@ typedef struct {
     LONG   debug_mode;
     LONG   open_count;
     LONG   orphan_count;          // Handles held by suspended (crashed) apps
+    struct MsgPort *adopt_port;   // Abandoned console port to attach (-A)
+    struct Process *adopt_proc;   // Process using the abandoned port
+    LONG   adopt_handles;         // Handles found referencing adopt_port
+    BOOL   adopted;               // app_cons_msgport is an adopted port
+    BOOL   keep_for_app;          // App still running: keep window and glob
+    ULONG  magic;                 // GLOB_MAGIC while valid
+    BOOL   kept_unlinked;         // Kept glob removed from reterm's list
+    BOOL   kept_released;         // Kept glob no longer needed by the app
+    void  *kept_prev;             // Earlier kept glob(s) for the same app
+    char   fake_title[8];         // Fake window title (app may keep pointer)
     ULONG  amiga_console_eventmask;
     ULONG  tab_comp_maxlen;       // Maximum length of path completion string
     ULONG  tab_comp_spos;         // Tab completion start position (consumer)
@@ -501,6 +514,416 @@ get_recent_process(glob_t *glob)
     return (get_task_from_mp(glob->child_rtask_mp) ?:
             get_task_from_mp(glob->child_wtask_mp) ?:
             get_task_from_mp(glob->child_stask_mp) ?: NULL);
+}
+
+/*
+ * Abandoned console ports
+ *
+ * When reterm is forced to exit while an application still has its console
+ * open, the console message port is left behind (abandoned) with no task to
+ * receive packets: mp_Flags is PA_IGNORE and mp_SigTask is NULL.  Older
+ * versions of reterm also did this when a client disconnected.  The
+ * application then hangs at its next console I/O.  reterm -a lists such
+ * ports, and reterm -A attaches a new session to one, so that the
+ * application may continue.
+ */
+
+/*
+ * An abandoned port records whether the console was in raw mode, so that
+ * a session attaching to it can restore the mode.  The port is private, so
+ * its node priority is otherwise unused.
+ */
+#define PORT_PRI_RAW_MODE 1
+#define GLOB_MAGIC        0x5254524d  // "RTRM"
+
+/*
+ * A kept glob (session state kept for an application which was still
+ * running when its session detached) is linked in the session list of the
+ * reterm which created it until that reterm's main() notices the session
+ * ended.  It may only be freed once it is both unlinked from that list
+ * and no longer needed by the application.  Whichever happens last frees
+ * it.  The flags are tested and set under Forbid(), as the two may be in
+ * different reterm processes.
+ */
+static void
+free_kept_glob(glob_t *glob)
+{
+    if (glob->fake_window != NULL)
+        CloseWindow(glob->fake_window);
+    glob->magic = 0;
+    FreeVec(glob);
+}
+
+/*
+ * free_kept_globs() releases session state which was kept for an
+ *                   application which has since exited.
+ */
+static void
+free_kept_globs(glob_t *glob)
+{
+    while (glob != NULL) {
+        glob_t *prev = (glob_t *) glob->kept_prev;
+        BOOL    can_free;
+        if (glob->magic != GLOB_MAGIC)
+            break;
+        Forbid();
+        can_free = glob->kept_unlinked;
+        if (can_free == FALSE)
+            glob->kept_released = TRUE;  // Creating reterm will free it
+        Permit();
+        if (can_free)
+            free_kept_glob(glob);
+        glob = prev;
+    }
+}
+
+static BOOL
+port_is_abandoned(struct MsgPort *mp)
+{
+    return ((mp != NULL) && (mp->mp_Node.ln_Type == NT_MSGPORT) &&
+            ((mp->mp_Flags & PF_ACTION) == PA_IGNORE) &&
+            (mp->mp_SigTask == NULL));
+}
+
+/*
+ * task_is_suspended() returns TRUE if the task is waiting for no signals,
+ *                     which is the state of a task which crashed and was
+ *                     suspended at the "Software Failure" requester.
+ */
+static BOOL
+task_is_suspended(struct Task *task)
+{
+    return ((task->tc_State == TS_WAIT) && (task->tc_SigWait == 0));
+}
+
+/*
+ * proc_port_refs() checks whether a process references a console port,
+ *                  through its console task or standard file handles.
+ *                  If *portp is NULL, the first abandoned port referenced
+ *                  is used and returned in *portp.  The number of distinct
+ *                  file handles referencing the port is returned in
+ *                  *handles.  Caller must Forbid().
+ */
+static BOOL
+proc_port_refs(struct Process *proc, struct MsgPort **portp, LONG *handles)
+{
+    struct CommandLineInterface *cli = BADDR(proc->pr_CLI);
+    struct MsgPort *port = *portp;
+    struct MsgPort *ct   = (struct MsgPort *) proc->pr_ConsoleTask;
+    BPTR fhs[7];
+    int  nfh = 0;
+    int  cur;
+    int  prev;
+
+    *handles = 0;
+    fhs[nfh++] = proc->pr_CIS;
+    fhs[nfh++] = proc->pr_COS;
+    fhs[nfh++] = proc->pr_CES;
+    if (cli != NULL) {
+        fhs[nfh++] = cli->cli_StandardInput;
+        fhs[nfh++] = cli->cli_StandardOutput;
+        fhs[nfh++] = cli->cli_CurrentInput;
+        fhs[nfh++] = cli->cli_CurrentOutput;
+    }
+
+    if (port == NULL) {
+        if (port_is_abandoned(ct)) {
+            port = ct;
+        } else {
+            for (cur = 0; cur < nfh; cur++) {
+                struct FileHandle *fh = BADDR(fhs[cur]);
+                if ((fh != NULL) && port_is_abandoned(fh->fh_Type)) {
+                    port = fh->fh_Type;
+                    break;
+                }
+            }
+        }
+        if (port == NULL)
+            return (FALSE);
+    }
+
+    for (cur = 0; cur < nfh; cur++) {
+        struct FileHandle *fh = BADDR(fhs[cur]);
+        if ((fh == NULL) || (fh->fh_Type != port))
+            continue;
+        for (prev = 0; prev < cur; prev++)
+            if (fhs[prev] == fhs[cur])
+                break;
+        if (prev == cur)
+            (*handles)++;  // Not seen before
+    }
+    if ((*handles == 0) && (ct != port))
+        return (FALSE);
+    *portp = port;
+    return (TRUE);
+}
+
+/*
+ * port_users() counts the processes referencing a console port, and the
+ *              distinct file handles they hold.  Suspended processes are
+ *              counted only if count_suspended is TRUE.  Caller must
+ *              Forbid().
+ */
+static int
+port_users(struct MsgPort *port, BOOL count_suspended, LONG *handles)
+{
+    struct List *lists[2];
+    struct Node *node;
+    int          users = 0;
+    int          list;
+
+    lists[0] = &((struct ExecBase *) SysBase)->TaskWait;
+    lists[1] = &((struct ExecBase *) SysBase)->TaskReady;
+    if (handles != NULL)
+        *handles = 0;
+    for (list = 0; list < 2; list++) {
+        for (node = lists[list]->lh_Head; node->ln_Succ != NULL;
+             node = node->ln_Succ) {
+            struct MsgPort *mp = port;
+            LONG            count;
+            if (node->ln_Type != NT_PROCESS)
+                continue;
+            if ((count_suspended == FALSE) &&
+                task_is_suspended((struct Task *) node))
+                continue;
+            if (proc_port_refs((struct Process *) node, &mp, &count)) {
+                users++;
+                if (handles != NULL)
+                    *handles += count;
+            }
+        }
+    }
+    return (users);
+}
+
+/* port_in_use() returns TRUE if a running process references the port */
+static BOOL
+port_in_use(struct MsgPort *port)
+{
+    int users;
+    Forbid();
+    users = port_users(port, FALSE, NULL);
+    Permit();
+    return (users > 0);
+}
+
+/* proc_command_name() gets the name of the command a CLI process runs */
+static void
+proc_command_name(struct Process *proc, char *name, int namelen)
+{
+    struct CommandLineInterface *cli = BADDR(proc->pr_CLI);
+    UBYTE *bstr = (cli != NULL) ? BADDR(cli->cli_CommandName) : NULL;
+
+    if ((bstr != NULL) && (bstr[0] != 0)) {
+        int len = (bstr[0] < namelen) ? bstr[0] : namelen - 1;
+        memcpy(name, bstr + 1, len);
+        name[len] = '\0';
+    } else if (cli != NULL) {
+        strncpy(name, "(shell)", namelen);
+        name[namelen - 1] = '\0';
+    } else {
+        strncpy(name, proc->pr_Task.tc_Node.ln_Name ?: "?", namelen);
+        name[namelen - 1] = '\0';
+    }
+}
+
+/*
+ * list_abandoned_ports() displays the processes which are using an
+ *                        abandoned console port.
+ */
+static void
+list_abandoned_ports(void)
+{
+    typedef struct {
+        struct MsgPort *port;
+        LONG            cli_num;
+        LONG            queued;
+        BOOL            suspended;
+        char            name[32];
+    } abandoned_t;
+    abandoned_t  *ent;
+    struct List  *lists[2];
+    struct Node  *node;
+    int           count = 0;
+    int           max   = 64;
+    int           list;
+    int           cur;
+
+    ent = AllocVec(sizeof (*ent) * max, MEMF_PUBLIC | MEMF_CLEAR);
+    if (ent == NULL) {
+        warnx("Out of memory");
+        return;
+    }
+    lists[0] = &((struct ExecBase *) SysBase)->TaskWait;
+    lists[1] = &((struct ExecBase *) SysBase)->TaskReady;
+
+    Forbid();
+    for (list = 0; list < 2; list++) {
+        for (node = lists[list]->lh_Head;
+             (node->ln_Succ != NULL) && (count < max); node = node->ln_Succ) {
+            struct Process *proc = (struct Process *) node;
+            struct MsgPort *port = NULL;
+            LONG            handles;
+            if (node->ln_Type != NT_PROCESS)
+                continue;
+            if (proc_port_refs(proc, &port, &handles) == FALSE)
+                continue;
+            ent[count].port      = port;
+            ent[count].cli_num   = proc->pr_TaskNum;
+            ent[count].suspended = task_is_suspended(&proc->pr_Task);
+            ent[count].queued    = 0;
+            {
+                struct Node *msg;
+                for (msg = port->mp_MsgList.lh_Head; msg->ln_Succ != NULL;
+                     msg = msg->ln_Succ)
+                    ent[count].queued++;
+            }
+            proc_command_name(proc, ent[count].name, sizeof (ent[count].name));
+            count++;
+        }
+    }
+    Permit();
+
+    if (count == 0) {
+        printf("No abandoned console ports found\n");
+    } else {
+        printf("CLI  Port        State      Queued  Command\n");
+        for (cur = 0; cur < count; cur++) {
+            char cli_str[12];
+            if (ent[cur].cli_num == 0) {
+                /*
+                 * A non-CLI process (such as the reader thread of a reterm
+                 * which was run in the session) inherits the console task
+                 * of its parent.  It can not be attached with -A, so it is
+                 * shown only if no CLI process uses the same port.
+                 */
+                int other;
+                for (other = 0; other < count; other++)
+                    if ((ent[other].port == ent[cur].port) &&
+                        (ent[other].cli_num != 0))
+                        break;
+                if (other < count)
+                    continue;
+                strcpy(cli_str, "-");
+            } else {
+                sprintf(cli_str, "%ld", (long) ent[cur].cli_num);
+            }
+            printf("%3s  %08lx    %-9s  %6ld  %s\n",
+                   cli_str, (unsigned long) ent[cur].port,
+                   ent[cur].suspended ? "suspended" : "waiting",
+                   (long) ent[cur].queued, ent[cur].name);
+        }
+        printf("Use \"reterm -A <cli>\" to attach to a waiting program.\n");
+    }
+    FreeVec(ent);
+}
+
+/*
+ * claim_abandoned_port() finds the abandoned console port used by the
+ *                        specified CLI process, and marks it as claimed
+ *                        by this task so that no other reterm will attach
+ *                        to it.  The reader thread later takes it over.
+ */
+static BOOL
+claim_abandoned_port(glob_t *glob, LONG cli_num)
+{
+    struct Process *proc;
+    struct MsgPort *port = NULL;
+    LONG            handles;
+    const char     *errmsg = NULL;
+
+    Forbid();
+    proc = FindCliProc(cli_num);
+    if (proc == NULL) {
+        errmsg = "There is no CLI process %ld";
+    } else if (proc_port_refs(proc, &port, &handles) == FALSE) {
+        errmsg = "CLI %ld does not have an abandoned console";
+    } else if (task_is_suspended(&proc->pr_Task)) {
+        errmsg = "CLI %ld is suspended (crashed) and can not be resumed";
+    } else {
+        (void) port_users(port, TRUE, &handles);
+        port->mp_SigTask   = FindTask(NULL);  // Claimed; still PA_IGNORE
+        glob->adopt_port    = port;
+        glob->adopt_proc    = proc;
+        glob->adopt_handles = handles;
+    }
+    Permit();
+
+    if (errmsg != NULL) {
+        warnx(errmsg, (long) cli_num);
+        return (FALSE);
+    }
+    return (TRUE);
+}
+
+/* unclaim_abandoned_port() releases a port claimed but not yet adopted */
+static void
+unclaim_abandoned_port(glob_t *glob)
+{
+    struct MsgPort *port = glob->adopt_port;
+    Forbid();
+    if ((port != NULL) && (port->mp_SigTask == FindTask(NULL)) &&
+        ((port->mp_Flags & PF_ACTION) == PA_IGNORE))
+        port->mp_SigTask = NULL;
+    Permit();
+}
+
+/*
+ * session_app_active() returns TRUE if the session application may still
+ *                      use the console.
+ */
+static BOOL
+session_app_active(glob_t *glob)
+{
+    if (glob->adopted)
+        return (port_in_use(glob->app_cons_msgport));
+    return (glob->open_count > glob->orphan_count);
+}
+
+/*
+ * report_detach() announces that a session has detached from a program
+ *                 which is still using its console.
+ */
+static void
+report_detach(glob_t *glob)
+{
+    struct MsgPort *port    = glob->app_cons_msgport;
+    LONG            cli_num = 0;
+    char            name[32];
+    struct List    *lists[2];
+    struct Node    *node;
+    int             list;
+
+    name[0]  = '\0';
+    lists[0] = &((struct ExecBase *) SysBase)->TaskWait;
+    lists[1] = &((struct ExecBase *) SysBase)->TaskReady;
+    Forbid();
+    for (list = 0; (list < 2) && (cli_num == 0); list++) {
+        for (node = lists[list]->lh_Head; node->ln_Succ != NULL;
+             node = node->ln_Succ) {
+            struct Process *proc = (struct Process *) node;
+            struct MsgPort *mp   = port;
+            LONG            handles;
+            if ((node->ln_Type != NT_PROCESS) ||
+                (proc->pr_TaskNum == 0) ||
+                task_is_suspended(&proc->pr_Task) ||
+                (proc_port_refs(proc, &mp, &handles) == FALSE))
+                continue;
+            cli_num = proc->pr_TaskNum;
+            proc_command_name(proc, name, sizeof (name));
+            break;
+        }
+    }
+    Permit();
+
+    if (cli_num != 0) {
+        warnx("Client %d: CLI %ld (%s) still using console; detached "
+              "(reattach with \"reterm -A %ld\")", glob->client_number,
+              (long) cli_num, name, (long) cli_num);
+    } else {
+        warnx("Client %d: program still using console; detached",
+              glob->client_number);
+    }
 }
 
 static void
@@ -1928,7 +2351,7 @@ fake_window(glob_t *glob)
                                            WA_Borderless, DOSTRUE,
                                            WA_Backdrop, DOSTRUE,
                                            WA_NoCareRefresh, DOSTRUE,
-                                           WA_Title, (ULONG) "Reterm",
+                                           WA_Title, (ULONG) glob->fake_title,
                                            TAG_DONE);
     }
     return (glob->fake_window);
@@ -4949,7 +5372,6 @@ reader_thread(register char *arg, register long len)
 {
     LONG  wake_sigbit;
     int   stop_count = 0;
-    BOOL  waiting_logged = FALSE;
     struct DateStamp stop_ds;
     LONG  tcp_read_sigbit = -1;
     ULONG reader_sigmask;
@@ -5000,7 +5422,33 @@ reader_thread(register char *arg, register long len)
     wake_sigbit = AllocSignal(-1L);
     glob->reader_wake_signal   = 1 << wake_sigbit;
 
-    glob->app_cons_msgport                      = CreateMsgPort();
+    if (glob->adopt_port != NULL) {
+        /* Take over the abandoned console port claimed by main() */
+        struct MsgPort *port = glob->adopt_port;
+        LONG            bit  = AllocSignal(-1L);
+        if (bit >= 0) {
+            Forbid();
+            port->mp_SigBit        = bit;
+            port->mp_SigTask       = task;
+            port->mp_Flags         = PA_SIGNAL;
+            glob->app_cons_msgport = port;
+            glob->adopted          = TRUE;
+            glob->open_count       = glob->adopt_handles;
+            glob->raw_mode = (port->mp_Node.ln_Pri == PORT_PRI_RAW_MODE);
+            {
+                glob_t *kept = (glob_t *) port->mp_Node.ln_Name;
+                if ((kept != NULL) && (TypeOfMem(kept) != 0) &&
+                    (kept->magic == GLOB_MAGIC))
+                    glob->kept_prev = (void *) kept;
+                port->mp_Node.ln_Name = NULL;
+            }
+            if (!IsMsgPortEmpty(port))
+                Signal(task, 1 << bit);  // Handle packets already queued
+            Permit();
+        }
+    } else {
+        glob->app_cons_msgport = CreateMsgPort();
+    }
     glob->reader_msgport       = reply_mp       = CreateMsgPort();
     glob->reader_timer_msgport = timer_mp       = CreateMsgPort();
     glob->xterm_timer_msgport  = xterm_timer_mp = CreateMsgPort();
@@ -5174,21 +5622,23 @@ break;
 
     /*
      * The application may still hold file handles which reference
-     * glob->app_cons_msgport.  That port must continue to be serviced
-     * (failing all I/O) until every handle has been closed.  Deleting it
-     * early would cause the application to hang (or crash) on its next
-     * console access.  Send break signals so that applications which are
-     * not doing console I/O will also notice and exit.
+     * glob->app_cons_msgport.  For a grace period, that port is serviced
+     * (failing all I/O) so that the application sees EOF and exits, as an
+     * idle shell will.  Send break signals so that applications which are
+     * not doing console I/O will also notice and exit.  If the application
+     * is still using the console after the grace period, the session
+     * detaches from it (see below).
      */
-    if (glob->open_count > glob->orphan_count)
+    if (glob->child_process_alive && session_app_active(glob)) {
+        /* Not already closing its console (where ACTION_END stops) */
         signal_child(glob, SIGBREAKF_CTRL_C | SIGBREAKF_CTRL_D);
+    }
     DateStamp(&stop_ds);
-    while ((glob->open_count > glob->orphan_count) ||
-           glob->runner_thread_alive) {
+    while (session_app_active(glob) || glob->runner_thread_alive) {
         /* Abort and fail any pending reads/waits (and pending WAIT timers) */
         abort_read_queue(glob, TRUE);
         handle_console_messages(glob);
-        if ((glob->open_count <= glob->orphan_count) &&
+        if ((session_app_active(glob) == FALSE) &&
             (glob->runner_thread_alive == FALSE))
             break;  // Application closed its console
         if (reterm_exiting)
@@ -5198,23 +5648,21 @@ break;
             Delay(1);  // Application should close the console soon
             continue;
         }
+        if (glob->runner_thread_alive) {
+            Delay(50);  // Runner (code in this program) should finish soon
+            continue;
+        }
         /*
          * The application is busy elsewhere (such as waiting on a requester
-         * or a long-running command).  Keep failing its console I/O until it
-         * closes the console, which may take a long time, but wake for
-         * each message rather than polling.  Deleting or abandoning the port
-         * would leave the application hung forever at its next console I/O.
+         * or a long-running command), or is an application such as an
+         * editor which does not exit on EOF.  Detach from it: the port is
+         * left abandoned (below), so the application blocks at its next
+         * console I/O rather than spinning on failed I/O, and it may later
+         * be reattached with "reterm -A".  This also frees the session.
+         * The port can not be deleted, as the application still uses it.
          */
-        if (waiting_logged == FALSE) {
-            DPRINT1("reader stop: waiting for app to close console");
-            waiting_logged = TRUE;
-        }
-        if (glob->runner_thread_alive) {
-            Delay(50);  // Runner should finish soon
-        } else {
-            Wait(app_cons_sigmask | glob->reader_wake_signal |
-                 SIGBREAKF_CTRL_C);
-        }
+        DPRINT1("reader stop: detaching from app");
+        break;
     }
     DPRINT1("reader stop: open_count=%d runner=%d waited=%d",
             glob->open_count, glob->runner_thread_alive, stop_count);
@@ -5316,7 +5764,30 @@ fail_exit:
         DeleteMsgPort(timer_mp);
     if (xterm_timer_mp != NULL)
         DeleteMsgPort(xterm_timer_mp);
-    if (glob->app_cons_msgport != NULL) {
+    if (glob->adopted) {
+        /*
+         * An adopted port is never deleted, as file handles which are not
+         * visible from the processes using it may still reference it.
+         * Return it to the abandoned state, so it may be attached again.
+         */
+        struct MsgPort *port   = glob->app_cons_msgport;
+        BOOL            in_use = port_in_use(port);
+        Forbid();
+        port->mp_Node.ln_Pri = glob->raw_mode ? PORT_PRI_RAW_MODE : 0;
+        port->mp_Flags       = PA_IGNORE;
+        port->mp_SigTask     = NULL;
+        Permit();
+        FreeSignal(port->mp_SigBit);
+        if (in_use) {
+            report_detach(glob);
+            glob->keep_for_app = TRUE;
+            port->mp_Node.ln_Name = (char *) glob;  // Kept state chain
+        } else {
+            /* Application exited: release state kept for it earlier */
+            free_kept_globs((glob_t *) glob->kept_prev);
+            glob->kept_prev = NULL;
+        }
+    } else if (glob->app_cons_msgport != NULL) {
         if ((glob->open_count > 0) || glob->runner_thread_alive) {
             /*
              * The application still has file handles referencing this
@@ -5325,11 +5796,17 @@ fail_exit:
              * Packets sent to it will no longer signal this (exiting) task.
              */
             if (glob->open_count > glob->orphan_count) {
-                warnx("Client %d app did not close console (%d open); "
-                      "leaking port", glob->client_number, glob->open_count);
+                report_detach(glob);
+                glob->keep_for_app = TRUE;
             }
+            Forbid();
+            if (glob->keep_for_app)
+                glob->app_cons_msgport->mp_Node.ln_Name = (char *) glob;
+            glob->app_cons_msgport->mp_Node.ln_Pri =
+                    glob->raw_mode ? PORT_PRI_RAW_MODE : 0;
             glob->app_cons_msgport->mp_Flags   = PA_IGNORE;
             glob->app_cons_msgport->mp_SigTask = NULL;
+            Permit();
         } else {
             DeleteMsgPort(glob->app_cons_msgport);
         }
@@ -5340,7 +5817,14 @@ fail_exit:
         FreeSignal(tcp_read_sigbit);
 
     tab_completion_wipe(glob);
-    if (glob->fake_window != NULL)
+    /*
+     * ACTION_DISK_INFO gave the application pointers to the fake window
+     * (id_VolumeNode) and to the console unit in this glob (id_InUse).  If
+     * the application is still running, it may use them at any time (an
+     * editor may restore the window title when it exits), so the window
+     * is left open and the glob is not freed.
+     */
+    if ((glob->fake_window != NULL) && (glob->keep_for_app == FALSE))
         CloseWindow(glob->fake_window);
 
     if (glob->reader_close_FHs) {
@@ -5524,6 +6008,13 @@ glob_init(glob_t **glob_p, glob_t *glob_proto)
     glob->node.mln_Pred        = NULL;
 
 finish_init:
+    strcpy(glob->fake_title, "Reterm");
+    glob->magic        = GLOB_MAGIC;
+    glob->kept_unlinked = FALSE;
+    glob->kept_released = FALSE;
+    glob->kept_prev    = NULL;
+    glob->keep_for_app = FALSE;
+    glob->fake_window  = NULL;
     glob->con_unit_ptr = &glob->con_unit;
     glob->id_inuse_req.io_Unit = (struct Unit *) &glob->con_unit;
     NewList(&glob->pending_reads);
@@ -5564,6 +6055,12 @@ handle_connection(glob_t *glob_p, char *runner_cmd)
                       NP_StackSize, 1600,  // Minimum stack for printf(), etc
                       NP_ExitData, (ULONG) glob,
                       TAG_END);
+
+    if (glob->adopt_port != NULL) {
+        /* Attaching to an existing program: there is nothing to run */
+        glob->child_process_alive = TRUE;
+        return (FALSE);
+    }
 
     /*
      * Start the runner thread to execute the requested program.
@@ -5629,7 +6126,19 @@ handle_task_end(glob_t *glob_p, BOOL do_warn, BOOL quiet)
             if (node->mln_Succ != NULL)
                 node->mln_Succ->mln_Pred = node->mln_Pred;
             node = node->mln_Pred;
-            glob_free(glob);
+            if (glob->keep_for_app) {
+                /* State kept for a still-running application */
+                BOOL can_free;
+                Forbid();
+                can_free = glob->kept_released;
+                if (can_free == FALSE)
+                    glob->kept_unlinked = TRUE;  // Freed when app is done
+                Permit();
+                if (can_free)
+                    free_kept_glob(glob);
+            } else {
+                glob_free(glob);
+            }
         } else {
             /* Task still running */
             count++;
@@ -5732,6 +6241,7 @@ main(int argc, char *argv[])
     int             daemon_count  = 0;
     int             current_count = 0;
     int             accept_fail_count = 0;
+    LONG            attach_cli    = 0;
     int             arg;
 
 // XXX: (argc == 0) means this program was started by WorkBench
@@ -5780,6 +6290,22 @@ struct DaemonMessage {
             while (*(++ptr) != '\0') {
                 char ch = *ptr;
                 switch (ch) {
+                    case 'a':  // List abandoned console ports
+                        list_abandoned_ports();
+                        goto fail_exit;
+                    case 'A': {  // Attach to abandoned console port
+                        char  *endptr;
+                        if (++arg >= argc) {
+                            warnx("-%c requires a CLI number", ch);
+                            goto fail_exit;
+                        }
+                        attach_cli = conv_int(argv[arg], &endptr);
+                        if ((*endptr != '\0') || (attach_cli <= 0)) {
+                            warnx("Invalid CLI number %s", argv[arg]);
+                            goto fail_exit;
+                        }
+                        break;
+                    }
                     case 'C':  // Capture xterm {input}/output
                         if (++arg >= argc) {
                             warnx("-%c requires a filename", ch);
@@ -5934,6 +6460,18 @@ handle_capture:
         /* Default to capture both input and output */
         glob->capture_input  = TRUE;
         glob->capture_output = TRUE;
+    }
+
+    if (attach_cli != 0) {
+        if (daemon_count > 0) {
+            warnx("-A can not be used with -d");
+            goto fail_exit;
+        }
+        if (claim_abandoned_port(glob, attach_cli) == FALSE)
+            goto fail_exit;
+        glob->child_rtask_mp = &glob->adopt_proc->pr_MsgPort;
+        if (glob->tcp_port == 0)
+            printf("Attached to CLI %ld\n", (long) attach_cli);
     }
 
     LONG master_sock = -1;
@@ -6102,6 +6640,7 @@ fail_exit:
         Close(glob->capture_AFH);
     if (glob->capture_XFH != 0)
         Close(glob->capture_XFH);
+    unclaim_abandoned_port(glob);
     glob_free(glob);
     if (IntuitionBase != NULL) {
         CloseLibrary(IntuitionBase);
