@@ -131,11 +131,23 @@ struct Library *IntuitionBase = NULL;
 BOOL __check_abort_enabled = 0;     // Disable clib2 ^C break handling
 
 /*
- * reterm_exiting is set when reterm itself is shutting down (as opposed to a
- * single session ending).  Session reader threads then stop waiting for the
- * application to close its console, so that reterm can exit.
+ * reterm_exiting is set when the user forces reterm to exit (a second break)
+ * while applications still have a reterm console open.  Session reader
+ * threads then stop waiting for the application to close its console, and
+ * leak the console port so that reterm can exit.
  */
 static volatile BOOL reterm_exiting = FALSE;
+
+/* ticks_since() returns the number of ticks (1/50 s) since the DateStamp */
+static LONG
+ticks_since(const struct DateStamp *start)
+{
+    struct DateStamp now;
+    DateStamp(&now);
+    return (((now.ds_Days - start->ds_Days) * 1440 +
+             (now.ds_Minute - start->ds_Minute)) * 60 * TICKS_PER_SECOND +
+            (now.ds_Tick - start->ds_Tick));
+}
 unsigned int __stack_size  = 4096;  // Minimum stack size for main
 
 typedef struct {
@@ -468,7 +480,6 @@ static void
 stop_readers(glob_t *glob_p)
 {
     struct MinNode *node;
-    reterm_exiting = TRUE;
     for (node = &glob_p->node; node != NULL; node = node->mln_Succ) {
         glob_t *glob = (glob_t *) node;
         glob->stopping = TRUE;
@@ -878,6 +889,23 @@ task_window_button_press(struct Window *window, struct Gadget *gadget)
 }
 
 /*
+ * is_requester_helper() returns TRUE if the specified task opens requester
+ *                       windows on behalf of other programs.  The AmigaOS 3.2
+ *                       AssignWedge task opens the "Volume Request" window
+ *                       which would otherwise be opened by the program.
+ *                       Caller must hold LockIBase() or Forbid().
+ */
+static BOOL
+is_requester_helper(struct Task *task)
+{
+    const char *name;
+    if (task == NULL)
+        return (FALSE);
+    name = task->tc_Node.ln_Name;
+    return ((name != NULL) && (strstr(name, "AssignWedge") != NULL));
+}
+
+/*
  * task_window_kill() will prompt the user to kill (by gadget selection) a
  *                    window opened by the child application.  This is mostly
  *                    useful to terminate requesters which have popped up so
@@ -890,9 +918,12 @@ task_window_kill(glob_t *glob, UBYTE cmd)
     int                   gadget_count;
     int                   gadget_want = 0;
     struct Screen        *screen;
-    struct Window        *window;
+    struct Window        *window = NULL;
+    struct Window        *cwindow;
     struct Gadget        *gadget;
     struct Gadget        *gadget_wanted = NULL;
+    int                   pass;
+    int                   helper_windows = 0;
     struct Gadget        *firstgadget = NULL;
     struct Task          *task = (struct Task *) get_recent_process(glob);
     struct IntuitionBase *ibase = (struct IntuitionBase *) IntuitionBase;
@@ -915,39 +946,70 @@ task_window_kill(glob_t *glob, UBYTE cmd)
         return (TRUE);
     }
 
+    /*
+     * Pass 0 looks for a window opened by the application itself (such as
+     * a DOS "System Request").  If there is none, pass 1 looks for a window
+     * opened on the application's behalf by a requester helper task, such
+     * as the AmigaOS 3.2 AssignWedge "Volume Request".  Such a window can
+     * not be tied to a specific application, so more than one may be open.
+     * Pass 1 is skipped if the application is waiting on console I/O, as
+     * it then can not be waiting on a requester.
+     */
     ilock = LockIBase(0);
-    for (screen = ibase->FirstScreen; screen != NULL;
-         screen = screen->NextScreen) {
-        for (window = screen->FirstWindow; window != NULL;
-             window = window->NextWindow) {
-            if ((window->UserPort != NULL) &&
-                (struct Task *) (window->UserPort->mp_SigTask) == task) {
-                for (gadget = window->FirstGadget; gadget != NULL;
+    for (pass = 0; pass < 2; pass++) {
+        if ((pass == 1) &&
+            ((glob->pending_reads.lh_Head->ln_Succ != NULL) ||
+             (glob->pending_app_packet != NULL)))
+            break;
+        for (screen = ibase->FirstScreen; screen != NULL;
+             screen = screen->NextScreen) {
+            for (cwindow = screen->FirstWindow; cwindow != NULL;
+                 cwindow = cwindow->NextWindow) {
+                struct Task *owner;
+                if (cwindow->UserPort == NULL)
+                    continue;
+                owner = (struct Task *) cwindow->UserPort->mp_SigTask;
+                if ((pass == 0) ? (owner != task) :
+                                  (is_requester_helper(owner) == FALSE))
+                    continue;
+                for (gadget = cwindow->FirstGadget; gadget != NULL;
                      gadget = gadget->NextGadget) {
                     ULONG gtype = gadget->GadgetType;
                     if (((gtype & GTYP_GADGETTYPE) == 0) &&
                         (((gtype & GTYP_GTYPEMASK) == GTYP_CUSTOMGADGET) ||
-                         ((gtype & GTYP_GTYPEMASK) == GTYP_BOOLGADGET)) &&
-                        (firstgadget == NULL)) {
-                        firstgadget = gadget;
+                         ((gtype & GTYP_GTYPEMASK) == GTYP_BOOLGADGET))) {
+                        if (firstgadget == NULL) {
+                            /* First (most recent) matching window */
+                            firstgadget = gadget;
+                            window = cwindow;
+                        }
+                        helper_windows++;
+                        break;
                     }
                 }
-                if (firstgadget != NULL)
-                    goto gotgadget;
             }
         }
+        if (firstgadget != NULL)
+            break;
+        helper_windows = 0;
     }
     UnlockIBase(ilock);
-    glob->requester_abort_active = FALSE;
-    return (FALSE);
+    if (firstgadget == NULL) {
+        glob->requester_abort_active = FALSE;
+        return (FALSE);
+    }
 
-    gotgadget:
-    UnlockIBase(ilock);
     if (glob->requester_abort_active == FALSE) {
-        char buf[128];
+        char buf[160];
         xterm_console_emit(glob, buf,
                 sprintf(buf, "Application has \"%.60s\" window open.\r\n",
                         window->Title ?: (UBYTE *)""));
+        if ((pass == 1) && (helper_windows > 1)) {
+            xterm_console_emit(glob, buf,
+                    sprintf(buf, "Warning: %d such windows are open; this one "
+                            "may belong to another program.\r\n",
+                            helper_windows));
+        }
     }
     gadget_count = 0;
     for (gadget = firstgadget; gadget != NULL; gadget = gadget->NextGadget) {
@@ -4739,6 +4801,8 @@ reader_thread(register char *arg, register long len)
 {
     LONG  wake_sigbit;
     int   stop_count = 0;
+    BOOL  waiting_logged = FALSE;
+    struct DateStamp stop_ds;
     LONG  tcp_read_sigbit = -1;
     ULONG reader_sigmask;
     ULONG app_cons_sigmask;
@@ -4970,18 +5034,20 @@ break;
      */
     if (glob->open_count > 0)
         signal_child(glob, SIGBREAKF_CTRL_C | SIGBREAKF_CTRL_D);
+    DateStamp(&stop_ds);
     while ((glob->open_count > 0) || glob->runner_thread_alive) {
         /* Abort and fail any pending reads/waits (and pending WAIT timers) */
         abort_read_queue(glob, TRUE);
         handle_console_messages(glob);
         if ((glob->open_count == 0) && (glob->runner_thread_alive == FALSE))
             break;  // Application closed its console
-        if (++stop_count <= 500) {  // About 10 seconds
-            Delay(1);
-            continue;
-        }
         if (reterm_exiting)
             break;  // Leak the console port (below) so that reterm can exit
+        stop_count++;
+        if (ticks_since(&stop_ds) < 10 * TICKS_PER_SECOND) {
+            Delay(1);  // Application should close the console soon
+            continue;
+        }
         /*
          * The application is busy elsewhere (such as waiting on a requester
          * or a long-running command).  Keep failing its console I/O until it
@@ -4989,8 +5055,10 @@ break;
          * each message rather than polling.  Deleting or abandoning the port
          * would leave the application hung forever at its next console I/O.
          */
-        if (stop_count == 501)
+        if (waiting_logged == FALSE) {
             DPRINT1("reader stop: waiting for app to close console");
+            waiting_logged = TRUE;
+        }
         if (glob->runner_thread_alive) {
             Delay(50);  // Runner should finish soon
         } else {
@@ -5418,6 +5486,43 @@ handle_task_end(glob_t *glob_p, BOOL do_warn, BOOL quiet)
     return (count);
 }
 
+/*
+ * report_busy_sessions() lists sessions whose application has not yet
+ *                        closed its console, preventing reterm from exiting.
+ */
+static void
+report_busy_sessions(glob_t *glob_p)
+{
+    struct MinNode *node;
+    for (node = glob_p->node.mln_Succ; node != NULL; node = node->mln_Succ) {
+        glob_t         *glob = (glob_t *) node;
+        struct Process *proc;
+        char            name[40];
+
+        if (glob->reader_thread_alive == FALSE)
+            continue;
+        strcpy(name, "unknown");
+        Forbid();
+        proc = get_recent_process(glob);
+        if (is_valid_task(proc)) {
+            struct CommandLineInterface *cli = BADDR(proc->pr_CLI);
+            UBYTE *bstr = (cli != NULL) ? BADDR(cli->cli_CommandName) : NULL;
+            if ((bstr != NULL) && (bstr[0] != 0)) {
+                int len = (bstr[0] < sizeof (name)) ? bstr[0] :
+                                                      sizeof (name) - 1;
+                memcpy(name, bstr + 1, len);
+                name[len] = '\0';
+            } else if (proc->pr_Task.tc_Node.ln_Name != NULL) {
+                strncpy(name, proc->pr_Task.tc_Node.ln_Name, sizeof (name));
+                name[sizeof (name) - 1] = '\0';
+            }
+        }
+        Permit();
+        warnx("Client %d: waiting for \"%s\" to close its console",
+              glob->client_number, name);
+    }
+}
+
 /* readers_alive() returns TRUE if any session reader thread is running */
 static BOOL
 readers_alive(glob_t *glob_p)
@@ -5438,9 +5543,17 @@ handle_signals(glob_t *glob)
 
     if ((signals & SIGBREAKF_CTRL_C) &&
         ((glob->tcp_port != 0) || (glob->reader_IFH != Input()))) {
-        warnx("**Aborting reterm due to ^C Break**");
-        stop_readers(glob);
-        signal_readers(glob, 0);
+        if (glob->stopping == FALSE) {
+            warnx("**Aborting reterm due to ^C Break**");
+            stop_readers(glob);
+            signal_readers(glob, 0);
+        } else if ((reterm_exiting == FALSE) && readers_alive(glob)) {
+            /* Second break: give up on applications which are still busy */
+            warnx("**Forcing reterm exit: programs still using a reterm "
+                  "console will hang**");
+            reterm_exiting = TRUE;
+            signal_readers(glob, 0);
+        }
     }
 
     if (signals & SIGBREAKF_CTRL_F) {
@@ -5778,17 +5891,46 @@ no_task_to_run:
             break;
     } while (daemon_count > 0);
 
-    int stop_count  = 0;
+    int              stop_count = 0;
+    BOOL             reported   = FALSE;
+    BOOL             forced     = FALSE;
+    struct DateStamp stop_ds;
     while (handle_task_end(glob, FALSE, quiet) > 0) {
         handle_signals(glob);
         /*
          * Reader threads run code in this program, so they must be gone
-         * before reterm exits.  They take at most about 10 seconds after
-         * stop_readers().  Stuck application processes are not waited for.
+         * before reterm exits.  A reader thread does not exit until its
+         * application has closed the console, because the application
+         * would otherwise hang at its next console I/O.  That may take a
+         * long time (for example, a requester which nobody has answered),
+         * so the user may force an exit with a second break.
          */
-        if (glob->stopping && (stop_count++ > 20) &&
-            ((readers_alive(glob) == FALSE) || (stop_count > 750)))
-            break;
+        if (glob->stopping && (stop_count == 0))
+            DateStamp(&stop_ds);
+        if (reterm_exiting && (forced == FALSE)) {
+            DateStamp(&stop_ds);  // Restart the clock for forced exit
+            forced = TRUE;
+        }
+        if (glob->stopping && (stop_count++ > 20)) {
+            if (readers_alive(glob) == FALSE)
+                break;
+            if (forced) {
+                if (ticks_since(&stop_ds) > 15 * TICKS_PER_SECOND)
+                    break;
+            } else if ((reported == FALSE) &&
+                       (ticks_since(&stop_ds) > 5 * TICKS_PER_SECOND)) {
+                reported = TRUE;
+                if (glob->tcp_socket_master >= 0) {
+                    /* Refuse new connections while waiting */
+                    shutdown(glob->tcp_socket_master, 2);  // SHUT_RDWR
+                    CloseSocket(glob->tcp_socket_master);
+                    glob->tcp_socket_master = -1;
+                }
+                report_busy_sessions(glob);
+                warnx("Waiting for these programs to exit; "
+                      "break again to force reterm exit");
+            }
+        }
         Delay(1);
     }
 
