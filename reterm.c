@@ -189,6 +189,7 @@ typedef struct {
     termtype_t          term_type;
     LONG   debug_mode;
     LONG   open_count;
+    LONG   orphan_count;          // Handles held by suspended (crashed) apps
     ULONG  amiga_console_eventmask;
     ULONG  tab_comp_maxlen;       // Maximum length of path completion string
     ULONG  tab_comp_spos;         // Tab completion start position (consumer)
@@ -888,6 +889,150 @@ task_window_button_press(struct Window *window, struct Gadget *gadget)
     FreeVec(im);
 }
 
+static int __regargs
+#ifdef FBASEREL
+__saveds
+#endif
+runner_thread(register char *arg, register long len);
+
+/*
+ * gadget_label() returns the text label of a gadget, or NULL if it has none.
+ */
+static UBYTE *
+gadget_label(struct Gadget *gadget)
+{
+    struct IntuiText *it;
+    switch (gadget->Flags & GFLG_LABELMASK) {
+        case GFLG_LABELSTRING:
+            return ((UBYTE *) gadget->GadgetText);
+        case GFLG_LABELITEXT:
+            it = gadget->GadgetText;
+            return ((it != NULL) ? it->IText : NULL);
+        default:  // GFLG_LABELIMAGE: GadgetText is an Image
+            return (NULL);
+    }
+}
+
+/*
+ * label_matches() compares a gadget label with a word, ignoring case and
+ *                 keyboard shortcut underscores.
+ */
+static BOOL
+label_matches(const UBYTE *label, const char *word)
+{
+    if (label == NULL)
+        return (FALSE);
+    while (*label != '\0') {
+        UBYTE ch = *label++;
+        if (ch == '_')
+            continue;
+        if ((ch >= 'A') && (ch <= 'Z'))
+            ch += 'a' - 'A';
+        if (ch != (UBYTE) *word++)
+            return (FALSE);
+    }
+    return (*word == '\0');
+}
+
+/*
+ * dup_path_list() returns a copy of a CLI command path list (cli_CommandDir)
+ *                 suitable for NP_Path, or 0 if the list is empty.
+ */
+static BPTR
+dup_path_list(BPTR list)
+{
+    BPTR  head = 0;
+    BPTR *tail = &head;
+    int   count = 0;
+
+    /* Each node is { BPTR next; BPTR lock; }, allocated with AllocVec() */
+    while ((list != 0) && (count++ < 100)) {
+        BPTR *node = BADDR(list);
+        BPTR *copy = AllocVec(2 * sizeof (BPTR), MEMF_PUBLIC | MEMF_CLEAR);
+        if (copy == NULL)
+            break;
+        copy[1] = DupLock(node[1]);
+        if (copy[1] == 0) {
+            FreeVec(copy);
+        } else {
+            *tail = MKBADDR(copy);
+            tail  = &copy[0];
+        }
+        list = node[0];
+    }
+    return (head);
+}
+
+/*
+ * replace_suspended_shell() starts a new shell on the session console to
+ *                           replace a shell process which crashed and was
+ *                           suspended at the "Software Failure" requester.
+ *                           The suspended process will never close its
+ *                           console handles, so those are counted as
+ *                           orphaned.  The new shell inherits the command
+ *                           path and current directory of the old one.
+ */
+static void
+replace_suspended_shell(glob_t *glob, struct Process *proc)
+{
+    char  runner_name[64];
+    BPTR  path    = 0;
+    BPTR  curdir  = 0;
+    struct CommandLineInterface *cli;
+
+    if (glob->runner_thread_alive) {
+        const char *msg = "Session is already starting a shell.\r\n";
+        xterm_console_emit(glob, msg, strlen(msg));
+        return;
+    }
+
+    Forbid();
+    glob->orphan_count = glob->open_count;
+    glob->child_rtask_mp = NULL;
+    glob->child_wtask_mp = NULL;
+    glob->child_stask_mp = NULL;
+    Permit();
+
+    /* The suspended process is frozen, so its CLI may be safely read */
+    if (is_valid_task(proc) &&
+        (proc->pr_Task.tc_Node.ln_Type == NT_PROCESS)) {
+        cli = BADDR(proc->pr_CLI);
+        if (cli != NULL)
+            path = dup_path_list(cli->cli_CommandDir);
+        if (proc->pr_CurrentDir != 0)
+            curdir = DupLock(proc->pr_CurrentDir);
+    }
+
+    {
+        const char *msg = "Starting a new shell to replace the suspended "
+                          "one.\r\n";
+        xterm_console_emit(glob, msg, strlen(msg));
+    }
+
+    sprintf(runner_name, "reterm-runner-%d", glob->client_number);
+    glob->runner_thread_alive = TRUE;
+    if (CreateNewProcTags(NP_Entry, (ULONG) runner_thread,
+                          NP_Cli, TRUE,
+                          (path != 0) ? NP_Path : TAG_IGNORE, (ULONG) path,
+                          (curdir != 0) ? NP_CurrentDir : TAG_IGNORE,
+                                          (ULONG) curdir,
+                          NP_Name, (ULONG) runner_name,
+                          NP_StackSize, 2000,
+                          NP_ExitData, (ULONG) glob,
+                          TAG_END) == NULL) {
+        warnx("Failed to start replacement runner");
+        glob->runner_thread_alive = FALSE;
+        if (curdir != 0)
+            UnLock(curdir);
+        while (path != 0) {
+            BPTR *node = BADDR(path);
+            path = node[0];
+            UnLock(node[1]);
+            FreeVec(node);
+        }
+    }
+}
+
 /*
  * is_requester_helper() returns TRUE if the specified task opens requester
  *                       windows on behalf of other programs.  The AmigaOS 3.2
@@ -1017,24 +1162,13 @@ task_window_kill(glob_t *glob, UBYTE cmd)
         if (((gtype & GTYP_GADGETTYPE) == 0) &&
             (((gtype & GTYP_GTYPEMASK) == GTYP_CUSTOMGADGET) ||
              ((gtype & GTYP_GTYPEMASK) == GTYP_BOOLGADGET))) {
-            struct IntuiText *it = gadget->GadgetText;
             UBYTE  buf[96];  // Max 84: 16 + 65 + CR LF NUL
 
             if (glob->requester_abort_active == FALSE) {
                 UBYTE *str;
                 UBYTE buf2[80];
 show_selected:
-                switch (gadget->Flags & GFLG_LABELMASK) {
-                    case GFLG_LABELSTRING:
-                        str = (UBYTE *) gadget->GadgetText;
-                        break;
-                    case GFLG_LABELITEXT:
-                        str = (it != NULL) ? it->IText : NULL;
-                        break;
-                    default:  // GFLG_LABELIMAGE: GadgetText is an Image
-                        str = NULL;
-                        break;
-                }
+                str = gadget_label(gadget);
 
                 if (str == NULL) {
                     str = buf2;
@@ -1072,8 +1206,20 @@ show_selected:
     }
 
     /* User has made a selection */
-    if (gadget_wanted != NULL)
+    if (gadget_wanted != NULL) {
+        /*
+         * Suspend at the "Software Failure" requester of the session's own
+         * application leaves that process (normally the shell, as CLI
+         * commands run in the shell process) frozen forever.  Replace it.
+         */
+        BOOL suspend = (pass == 0) && (window->Title != NULL) &&
+                       (strcmp((char *) window->Title,
+                               "Software Failure") == 0) &&
+                       label_matches(gadget_label(gadget_wanted), "suspend");
         task_window_button_press(window, gadget_wanted);
+        if (suspend)
+            replace_suspended_shell(glob, (struct Process *) task);
+    }
     glob->requester_abort_active = FALSE;
     return (TRUE);
 }
@@ -2018,7 +2164,9 @@ process_pkt:
 
                 if (glob->open_count > 0) {
                     glob->open_count--;
-                    if (glob->open_count == 0) {
+                    if (glob->open_count < glob->orphan_count)
+                        glob->orphan_count = glob->open_count;
+                    if (glob->open_count == glob->orphan_count) {
                         DPRINT2("ENDing");
                         if (glob->stopping == FALSE)
                             xterm_console_emit(glob, "\r\n", 2);
@@ -5032,14 +5180,16 @@ break;
      * console access.  Send break signals so that applications which are
      * not doing console I/O will also notice and exit.
      */
-    if (glob->open_count > 0)
+    if (glob->open_count > glob->orphan_count)
         signal_child(glob, SIGBREAKF_CTRL_C | SIGBREAKF_CTRL_D);
     DateStamp(&stop_ds);
-    while ((glob->open_count > 0) || glob->runner_thread_alive) {
+    while ((glob->open_count > glob->orphan_count) ||
+           glob->runner_thread_alive) {
         /* Abort and fail any pending reads/waits (and pending WAIT timers) */
         abort_read_queue(glob, TRUE);
         handle_console_messages(glob);
-        if ((glob->open_count == 0) && (glob->runner_thread_alive == FALSE))
+        if ((glob->open_count <= glob->orphan_count) &&
+            (glob->runner_thread_alive == FALSE))
             break;  // Application closed its console
         if (reterm_exiting)
             break;  // Leak the console port (below) so that reterm can exit
@@ -5174,8 +5324,10 @@ fail_exit:
              * the application performs console I/O, so it is leaked.
              * Packets sent to it will no longer signal this (exiting) task.
              */
-            warnx("Client %d app did not close console (%d open); "
-                  "leaking port", glob->client_number, glob->open_count);
+            if (glob->open_count > glob->orphan_count) {
+                warnx("Client %d app did not close console (%d open); "
+                      "leaking port", glob->client_number, glob->open_count);
+            }
             glob->app_cons_msgport->mp_Flags   = PA_IGNORE;
             glob->app_cons_msgport->mp_SigTask = NULL;
         } else {

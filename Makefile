@@ -13,7 +13,7 @@ CFLAGS  += -fomit-frame-pointer
 #CFLAGS += -pg   # Generate profile info to gmon.out.  To view:
 #                          m68k-amigaos-gprof reterm gmon.out
 
-LDFLAGS = -Xlinker -Map=$@.map -mcrt=clib2
+LDFLAGS = -Xlinker -Map=objs/$@.map -mcrt=clib2
 
 #CFLAGS += -g
 #LDFLAGS += -g
