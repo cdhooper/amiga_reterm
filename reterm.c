@@ -129,6 +129,13 @@ extern struct Library *DOSBase;
 struct Library *IntuitionBase = NULL;
 
 BOOL __check_abort_enabled = 0;     // Disable clib2 ^C break handling
+
+/*
+ * reterm_exiting is set when reterm itself is shutting down (as opposed to a
+ * single session ending).  Session reader threads then stop waiting for the
+ * application to close its console, so that reterm can exit.
+ */
+static volatile BOOL reterm_exiting = FALSE;
 unsigned int __stack_size  = 4096;  // Minimum stack size for main
 
 typedef struct {
@@ -367,8 +374,14 @@ debug_print_sequence(const char *msg, const UBYTE *buf, int len, BOOL addspace)
         last = ch;
         debug_print_char(ch, addspace);
     }
-    if (count != 0)
-        printf("x%d", count);
+    if (count != 0) {
+        if (count < 3) {
+            while (count-- > 0)
+                debug_print_char(last, addspace);
+        } else {
+            printf("x%d", count + 1);
+        }
+    }
     printf("\n");
 }
 
@@ -455,6 +468,7 @@ static void
 stop_readers(glob_t *glob_p)
 {
     struct MinNode *node;
+    reterm_exiting = TRUE;
     for (node = &glob_p->node; node != NULL; node = node->mln_Succ) {
         glob_t *glob = (glob_t *) node;
         glob->stopping = TRUE;
@@ -1229,7 +1243,7 @@ no_trans:
                     break;
                 buf += cur;
                 len -= cur;
-                len += add;
+                num += add;
                 switch (num) {
                     case 140:  /* System background 0 (xterm Black) */
                     case 141:  /* System background 1 (xterm Red) */
@@ -1385,6 +1399,8 @@ no_trans:
              * found there and then release the clipboard so that it can be
              * used by other applications.
              */
+            /* No xterm equivalent for these */
+            return;
         case 'w':  /* CSI Pn w - 3.2? window sequences */
             if ((buf[0] == '>') && (buf[1] == '?')) {
                 /*
@@ -2060,6 +2076,7 @@ tab_completion_pathlock(glob_t *glob, UBYTE *path, LONG pathlen)
             }
 
             lock = Lock(name, ACCESS_READ);
+            name[pos + 1] = tmp;  // Restore before any exit from the loop
 
             if (myproc != NULL) {
                 /* Allow requesters again */
@@ -2073,8 +2090,6 @@ tab_completion_pathlock(glob_t *glob, UBYTE *path, LONG pathlen)
                 lock = 0;
                 break;  // Examine failed
             }
-
-            name[pos + 1] = tmp;
 
             nlen = strlen(fib->fib_FileName);
             if (pathcur + nlen + 1 >= pathlen) {
@@ -2413,12 +2428,14 @@ my_assign_from_lock(BPTR lock, UBYTE *buf, LONG *buflen)
         return (FALSE);
 
     while ((ent = NextDosEntry(ent, LDF_ASSIGNS)) != NULL) {
-        if (SameLock(ent->dol_Lock, lock) == LOCK_SAME) {
+        /* Late and non-binding assigns may not have a lock */
+        if ((ent->dol_Lock != 0) &&
+            (SameLock(ent->dol_Lock, lock) == LOCK_SAME)) {
             UBYTE *bcpl_name = (UBYTE *) BADDR(ent->dol_Name);
             UBYTE  len = *bcpl_name;
+            if (len + 1 > *buflen)
+                break;  // Not enough space
             buf[--(*buflen)] = ':';
-            if (len > *buflen)
-                break;
             (*buflen) -= len;
             memcpy(buf + *buflen, bcpl_name + 1, len);
             found = TRUE;
@@ -2448,34 +2465,39 @@ static UBYTE *
 my_name_from_lock(BPTR lock, UBYTE *buf, LONG buflen)
 {
     struct FileInfoBlock *fib;
+    BPTR                  cur   = lock;
+    BOOL                  owned = FALSE;  // cur was obtained by ParentDir()
+    BOOL                  done  = FALSE;
 
     if (buflen == 0)
         return (NULL);
     buf[--buflen] = '\0';
 
-    fib = AllocDosObject(DOS_FIB, NULL);
-    if (fib == NULL)
-        return (NULL);
-
     if (lock == 0) {
         strcpy(buf, "SYS:");
         return (buf);
     }
-    while (lock != 0) {
-        int len;
-        BPTR plock = ParentDir(lock);
 
-        if ((plock != 0) && my_assign_from_lock(lock, buf, &buflen)) {
-            lock = 0;  // Finished early and matched system assign
+    fib = AllocDosObject(DOS_FIB, NULL);
+    if (fib == NULL)
+        return (NULL);
+
+    while (cur != 0) {
+        int len;
+        BPTR plock = ParentDir(cur);
+
+        if ((plock != 0) && my_assign_from_lock(cur, buf, &buflen)) {
+            UnLock(plock);
+            done = TRUE;  // Finished early and matched system assign
             break;
         }
 
-        if (Examine(lock, fib) == DOSFALSE)
-            break;  // Examine failed
-
-        len = strlen(fib->fib_FileName);
-        if (len >= buflen)
-            break;  // Not enough space
+        if ((Examine(cur, fib) == DOSFALSE) ||        // Examine failed
+            ((len = strlen(fib->fib_FileName)) >= buflen)) {  // No space
+            if (plock != 0)
+                UnLock(plock);
+            break;
+        }
 
         buflen--;
         memcpy(buf + buflen - len, fib->fib_FileName, len);
@@ -2484,11 +2506,20 @@ my_name_from_lock(BPTR lock, UBYTE *buf, LONG buflen)
         else
             buf[buflen] = '/';
         buflen -= len;
-        lock = plock;
+
+        if (owned)
+            UnLock(cur);
+        cur   = plock;
+        owned = TRUE;
+        if (cur == 0)
+            done = TRUE;  // Reached the root
     }
+    if (owned && (cur != 0))
+        UnLock(cur);
     FreeDosObject(DOS_FIB, fib);
-    if (lock != 0)
-        return (NULL);  // Failed above
+
+    if (done == FALSE)
+        return (NULL);
 
     return (buf + buflen);
 }
@@ -3462,9 +3493,9 @@ cursor_position:
             cur = getnum(buf, &num);
             if (cur == 0)
                 num = 0;
-            if (buf[cur] == ';') {
-                cur = getnum(buf + cur + 1, &mod);
-                if (cur == 0)
+            if ((cur > 0) && (buf[cur - 1] == ';')) {
+                /* getnum() consumed the ';' separator */
+                if (getnum(buf + cur, &mod) == 0)
                     mod = 0;
             } else {
                 mod = 0;
@@ -3516,7 +3547,7 @@ cursor_position:
                 case 20:   // F9  -> Amiga CSI 8 ~
                 case 21: { // F10 -> Amiga CSI 9 ~
                     UBYTE tbuf[8];
-                    num -= 11;
+                    num -= 12;
                     if (mod == 2)
                         num += 10;
                     sprintf(tbuf, STR_CSI "%d~", num);
@@ -3805,9 +3836,14 @@ update_input_line:
             } else {
                 /* Use cursor left and erase to end of line */
                 UBYTE tbuf[16];
-                xterm_console_emit(glob, tbuf,
-                        sprintf(tbuf, STR_ESC "[%uD" STR_ESC "[K",
-                                glob->cmdline_pos));
+                if (glob->cmdline_pos == 0) {
+                    /* ESC [ 0 D would move the cursor left one */
+                    xterm_console_emit(glob, STR_ESC "[K", 3);
+                } else {
+                    xterm_console_emit(glob, tbuf,
+                            sprintf(tbuf, STR_ESC "[%uD" STR_ESC "[K",
+                                    glob->cmdline_pos));
+                }
             }
             glob->cmdline_len = 0;
             glob->cmdline_pos = 0;
@@ -4040,9 +4076,9 @@ xterm_csi_cook_app_input(glob_t *glob, UBYTE cmd, const UBYTE *buf, int len)
             cur = getnum(buf, &num);
             if (cur == 0)
                 num = 0;
-            if (buf[cur] == ';') {
-                cur = getnum(buf + cur + 1, &mod);
-                if (cur == 0)
+            if ((cur > 0) && (buf[cur - 1] == ';')) {
+                /* getnum() consumed the ';' separator */
+                if (getnum(buf + cur, &mod) == 0)
                     mod = 0;
             } else {
                 mod = 0;
@@ -4131,7 +4167,9 @@ reader_process_xterm_to_amiga(glob_t *glob)
 
     if (xterm_timer_occurred(glob)) {
         if (glob->xta_mode == XT_MODE_ESC) {
-            append_to_app_input(glob, STR_ESC, 1);
+            /* Lone ESC key press (the cooked line editor ignores ESC) */
+            if (glob->raw_mode)
+                append_to_app_input(glob, STR_ESC, 1);
             glob->xta_mode = XT_MODE_NONE;
         }
     }
@@ -4256,8 +4294,21 @@ pass_through:
                         /* Pass the first ESC through and re-start ESC mode */
                         xterm_esc_timer_start(glob);
                         goto pass_through;
+                    case 'O':
+                        /*
+                         * ESC O x (SS3) is sent by xterm for F1-F4, and for
+                         * cursor / Home / End keys in application cursor
+                         * mode.  Handle it as a CSI sequence beginning with
+                         * 'O', which the CSI input handlers recognize.
+                         */
+                        glob->xta_mode = XT_MODE_CSI;
+                        glob->xta_cmdbuf[0] = 'O';
+                        glob->xta_cmdbuf_pos = 1;
+                        break;
                     default:
-                        xterm_esc_raw_app_input(glob, cmd);
+                        /* ESC x (such as Alt-x): only meaningful in raw mode */
+                        if (glob->raw_mode)
+                            xterm_esc_raw_app_input(glob, cmd);
                         glob->xta_mode = XT_MODE_NONE;
                         break;
                 }
@@ -4314,18 +4365,15 @@ pass_through:
                         break;
                     case TELNET_BRK:    // 0xf3 - Break interrupt (BRK)
                         warnx("Telnet BRK");
-                        signal_child(glob, 1 << (SIGBREAKB_CTRL_C + cmd -
-                                                 TELNET_BRK));
+                        signal_child(glob, SIGBREAKF_CTRL_C);
                         break;
                     case TELNET_IP:     // 0xf4 - Interrupt process (IP)
                         warnx("Telnet IP");
-                        signal_child(glob, 1 << (SIGBREAKB_CTRL_C + cmd -
-                                                 TELNET_BRK));
+                        signal_child(glob, SIGBREAKF_CTRL_C);
                         break;
                     case TELNET_AO:     // 0xf5 - Abort output (AO)
                         warnx("Telnet AO");
-                        signal_child(glob, 1 << (SIGBREAKB_CTRL_C + cmd -
-                                                 TELNET_BRK));
+                        signal_child(glob, SIGBREAKF_CTRL_E);
                         break;
                     case TELNET_WILL:   // 0xfb - Will Do
                     case TELNET_WONT:   // 0xfc - Will Not Do
@@ -4900,7 +4948,7 @@ break;
             Delay(1);
 
             /* Re-set signal if application message is waiting */
-            if (all_sigmask & app_cons_sigmask)
+            if (!IsMsgPortEmpty(glob->app_cons_msgport))
                 Signal(glob->reader_task, app_cons_sigmask);
         }
 
@@ -4926,9 +4974,29 @@ break;
         /* Abort and fail any pending reads/waits (and pending WAIT timers) */
         abort_read_queue(glob, TRUE);
         handle_console_messages(glob);
-        if (++stop_count > 500)  // About 10 seconds
-            break;
-        Delay(1);
+        if ((glob->open_count == 0) && (glob->runner_thread_alive == FALSE))
+            break;  // Application closed its console
+        if (++stop_count <= 500) {  // About 10 seconds
+            Delay(1);
+            continue;
+        }
+        if (reterm_exiting)
+            break;  // Leak the console port (below) so that reterm can exit
+        /*
+         * The application is busy elsewhere (such as waiting on a requester
+         * or a long-running command).  Keep failing its console I/O until it
+         * closes the console, which may take a long time, but wake for
+         * each message rather than polling.  Deleting or abandoning the port
+         * would leave the application hung forever at its next console I/O.
+         */
+        if (stop_count == 501)
+            DPRINT1("reader stop: waiting for app to close console");
+        if (glob->runner_thread_alive) {
+            Delay(50);  // Runner should finish soon
+        } else {
+            Wait(app_cons_sigmask | glob->reader_wake_signal |
+                 SIGBREAKF_CTRL_C);
+        }
     }
     DPRINT1("reader stop: open_count=%d runner=%d waited=%d",
             glob->open_count, glob->runner_thread_alive, stop_count);
@@ -5350,6 +5418,17 @@ handle_task_end(glob_t *glob_p, BOOL do_warn, BOOL quiet)
     return (count);
 }
 
+/* readers_alive() returns TRUE if any session reader thread is running */
+static BOOL
+readers_alive(glob_t *glob_p)
+{
+    struct MinNode *node;
+    for (node = glob_p->node.mln_Succ; node != NULL; node = node->mln_Succ)
+        if (((glob_t *) node)->reader_thread_alive)
+            return (TRUE);
+    return (FALSE);
+}
+
 static void
 handle_signals(glob_t *glob)
 {
@@ -5387,6 +5466,7 @@ main(int argc, char *argv[])
     BOOL            quiet         = FALSE;
     int             daemon_count  = 0;
     int             current_count = 0;
+    int             accept_fail_count = 0;
     int             arg;
 
 // XXX: (argc == 0) means this program was started by WorkBench
@@ -5619,8 +5699,14 @@ handle_capture:
         addr.sin_family      = AF_INET;
         addr.sin_len         = sizeof (addr);
 
-        bind(master_sock, (struct sockaddr *) &addr, sizeof (addr));
-        listen(master_sock, listen_count);
+        if (bind(master_sock, (struct sockaddr *) &addr, sizeof (addr)) < 0) {
+            warnx("bind to port %d failed: %d", glob->tcp_port, Errno());
+            goto fail_exit;
+        }
+        if (listen(master_sock, listen_count) < 0) {
+            warnx("listen on port %d failed: %d", glob->tcp_port, Errno());
+            goto fail_exit;
+        }
     }
 
     if (daemon_count == 0)
@@ -5636,9 +5722,19 @@ handle_capture:
             socklen_t len = sizeof (addr);
             LONG sock = accept(master_sock, (struct sockaddr *) &addr, &len);
             if (sock < 0) {
-                warnx("socket accept failed: %d", Errno());
-                break;
+                LONG error = Errno();
+                warnx("socket accept failed: %d", error);
+                /*
+                 * A break (EINTR) or repeated failure stops reterm.  Other
+                 * failures (such as a client which reset the connection
+                 * before it was accepted) are transient.
+                 */
+                if ((error == EINTR) || (++accept_fail_count >= 10))
+                    break;
+                Delay(25);
+                goto no_task_to_run;
             }
+            accept_fail_count = 0;
             glob->client_number++;
             if (!quiet) {
                 char *hostname = Inet_NtoA(addr.sin_addr.s_addr);
@@ -5685,7 +5781,13 @@ no_task_to_run:
     int stop_count  = 0;
     while (handle_task_end(glob, FALSE, quiet) > 0) {
         handle_signals(glob);
-        if ((glob->stopping) && (stop_count++ > 20))
+        /*
+         * Reader threads run code in this program, so they must be gone
+         * before reterm exits.  They take at most about 10 seconds after
+         * stop_readers().  Stuck application processes are not waited for.
+         */
+        if (glob->stopping && (stop_count++ > 20) &&
+            ((readers_alive(glob) == FALSE) || (stop_count > 750)))
             break;
         Delay(1);
     }
