@@ -207,6 +207,7 @@ typedef struct {
     struct Process *adopt_proc;   // Process using the abandoned port
     LONG   adopt_handles;         // Handles found referencing adopt_port
     BOOL   adopted;               // app_cons_msgport is an adopted port
+    BOOL   counts_exact;          // open_count counts every console handle
     BOOL   keep_for_app;          // App still running: keep window and glob
     ULONG  magic;                 // GLOB_MAGIC while valid
     BOOL   kept_unlinked;         // Kept glob removed from reterm's list
@@ -7489,8 +7490,19 @@ reader_thread(register char *arg, register long len)
             {
                 glob_t *kept = (glob_t *) port->mp_Node.ln_Name;
                 if ((kept != NULL) && (TypeOfMem(kept) != 0) &&
-                    (kept->magic == GLOB_MAGIC))
+                    (kept->magic == GLOB_MAGIC)) {
                     glob->kept_prev = (void *) kept;
+                    if (kept->counts_exact) {
+                        /*
+                         * The detached session counted every handle opened
+                         * on the port, so continue its count (rather than
+                         * that of the handles found by searching).
+                         */
+                        glob->open_count   = kept->open_count;
+                        glob->orphan_count = kept->orphan_count;
+                        glob->counts_exact = TRUE;
+                    }
+                }
                 port->mp_Node.ln_Name = NULL;
             }
             if (!IsMsgPortEmpty(port))
@@ -7499,6 +7511,7 @@ reader_thread(register char *arg, register long len)
         }
     } else {
         glob->app_cons_msgport = CreateMsgPort();
+        glob->counts_exact     = TRUE;  // Every handle is opened through it
     }
     glob->reader_msgport       = reply_mp       = CreateMsgPort();
     glob->reader_timer_msgport = timer_mp       = CreateMsgPort();
@@ -7833,19 +7846,39 @@ fail_exit:
     }
     if (glob->adopted) {
         /*
-         * An adopted port is never deleted, as file handles which are not
-         * visible from the processes using it may still reference it.
-         * Return it to the abandoned state, so it may be attached again.
+         * An adopted port may only be deleted if every handle opened on it
+         * is known to be closed: file handles which are not visible from
+         * the processes using it may still reference it.  The count is
+         * exact if it was continued from the session which created the
+         * port.  Otherwise, return the port to the abandoned state, so it
+         * may be attached again.
          */
         struct MsgPort *port   = glob->app_cons_msgport;
         BOOL            in_use = port_in_use(port);
+        BOOL            unused = (in_use == FALSE) && glob->counts_exact &&
+                                 (glob->open_count == 0);
         Forbid();
-        port->mp_Node.ln_Pri = glob->raw_mode ? PORT_PRI_RAW_MODE : 0;
-        port->mp_Flags       = PA_IGNORE;
-        port->mp_SigTask     = NULL;
+        if (unused && IsMsgPortEmpty(port)) {
+            port->mp_Flags = PA_IGNORE;
+        } else {
+            unused = FALSE;
+            port->mp_Node.ln_Pri = glob->raw_mode ? PORT_PRI_RAW_MODE : 0;
+            port->mp_Flags       = PA_IGNORE;
+            port->mp_SigTask     = NULL;
+        }
         Permit();
-        FreeSignal(port->mp_SigBit);
-        if (in_use) {
+        if (unused) {
+            /* Application exited, closing all handles: nothing remains */
+            free_kept_globs((glob_t *) glob->kept_prev);
+            glob->kept_prev        = NULL;
+            DeleteMsgPort(port);  // Also frees the signal (this task's)
+            glob->app_cons_msgport = NULL;
+        } else {
+            FreeSignal(port->mp_SigBit);
+        }
+        if (unused) {
+            /* Port deleted above */
+        } else if (in_use) {
             report_detach(glob);
             glob->keep_for_app = TRUE;
             port->mp_Node.ln_Name = (char *) glob;  // Kept state chain
@@ -8083,6 +8116,7 @@ finish_init:
     glob->kept_released = FALSE;
     glob->kept_prev    = NULL;
     glob->keep_for_app = FALSE;
+    glob->counts_exact = FALSE;
     glob->fake_window  = NULL;
     glob->con_unit_ptr = &glob->con_unit;
     glob->id_inuse_req.io_Unit = (struct Unit *) &glob->con_unit;
