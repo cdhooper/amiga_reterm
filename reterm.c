@@ -51,8 +51,7 @@ static const char version[] =
     "\0$VER: reterm " VERSION " ("BUILD_DATE" "BUILD_TIME") \xA9 Chris Hooper";
 
 static const char usage[] =
-    "\t-a         List abandoned console ports (programs left by a reterm)\n"
-    "\t-A <cli>   Attach to the abandoned console of CLI process <cli>\n"
+    "\t-A <cli>   Attach to abandoned console of CLI process (-a lists them)\n"
     "\t-c <file>  Capture app input/output to file\n"
     "\t-C <file>  Capture xterm input/output to file\n"
     "\t-d <count> Daemon mode (cnt = simultaneous daemons)\n"
@@ -69,7 +68,7 @@ static const char usage[] =
     "\t-r <ascii> Requester abort key (default ^C=3)\n"
     "\t-R         Disable ^C requester abort\n"
     "\t-s <size>  Stack size for child application\n"
-    "\t-t         Enable telnet protocol\n"
+    "\t-t         Enable telnet protocol (-T disables telnet)\n"
     "\t-u         Convert between xterm UTF-8 encoding and Amiga ISO 8859-1\n"
     "\t-v         Display program version\n"
     "\t-x         Force terminal to xterm (usually not needed)";

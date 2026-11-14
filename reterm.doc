@@ -16,7 +16,7 @@ Starting reterm and connecting
     application to terminate the connection:
         stty raw -echo onlcr && nc localhost 2000 ; stty sane
 
-    You can have stt configure the terminal differently which allows ^C to exit
+    You can have stty configure the terminal differently which allows ^C to exit
     nc, but this is probably not what you will want:
         stty -icanon -echo && nc localhost 2000 ; stty sane
 
@@ -27,11 +27,10 @@ Starting reterm and connecting
         luit -encoding ISO-8859-1 telnet localhost 2000 ; stty sane
 
     If you are running a telnet or ssh daemon on your Amiga, you can start
-    reterm after connecting to the session.  Example
+    reterm after connecting to the session.  Example:
         % telnet localhost 2000
         Connected to localhost.
         5.DH0:> reterm
-        Running: newshell CONSOLE:
         New Shell process 6
         6.DH0:> 
 
@@ -65,7 +64,7 @@ Input and the command line
     Completion section for more details.
     The following commands are understood by reterm in cooked mode:
         ^\                        - Terminate the current read with zero bytes
-        ^A                        - Go to the beginning of the input line
+        ^A (Shift-Cursor Left)    - Go to the beginning of the input line
         ^B (Cursor Left)          - Move the input cursor left
         ^D                        - Delete to the right or show tab completion
         ^E (Shift-Cursor Right)   - Go to the end of the input line
@@ -82,19 +81,18 @@ Input and the command line
         ^W                        - Delete word
         ^X                        - Clear entire input line
         ^Y                        - Show command history
-        ^Z                        - Show command history
         ^^ (Control-Cursor Left)  - Go to previous word in input line
         ^_ (Control-Cursor Right) - Go to next word in input line
            (Shift-Tab)            - Cycle to previous tab completion
 
 Tab completion
     When run with a shell which requests cooked input, reterm implements
-    Tab Completion for commands and command arguments.  If you enter the
+    Tab Completion for commands and command arguments.  If you enter
     a partial first or last part of a command and press Tab, the first
     completion will be shown.  Pressing Tab again will show the next match.
     You may also use Shift-Tab to cycle in the reverse direction.  Using
     Tab on the first word of a command line will cause reterm to search the
-    Path for an appropriate program to run, where using tab on the second
+    Path for an appropriate program to run, while using Tab on the second
     or subsequent words will cause reterm to search the current directory
     (or another directory as specified).  Examples are below.
     You enter (without pressing Return):
@@ -142,28 +140,30 @@ Tab completion
     If your cursor is at the end of the current line, pressing ^D will also
     show you matches to the entered command.  It's also a fast way to show the
     current directory.  Example:
-        5.DH0> Type ^D
+        5.DH0:> Type ^D
     after ^D is pressed, you will see the following:
           DPat              DW.config          History            PCD
           SPat              SetFont            SetKeyboard        Shell-Startup
           Startup-Sequence  bg                 fg                 fork
-        5.DH0> Type 
+        5.DH0:> Type 
 
 Programmers
-    Source code to this program is provided under the terms of the GPL v2.
-    Reterm implements three asynchronous threads.  One (the runner thread)
-    runs only long enough to start the captive child application.  The captive
-    child may be a shell or a console application (such as vim).  Another
-    (the reader thread) handles acquiring user input and xterm responses,
-    providing that input back to the child application when it performs Read()
-    calls.  The third, and main thread initializes data structures, starts the
-    reader and runner threads, and then services console handler packets that
-    arrive from the captive child application.  Because the Amiga CLI
-    applications expect a console handler, the full set of console handler
-    packets must be implemented by Reterm's message loop.
+    Source code to this program is provided under the terms of the BSD
+    2-Clause License (see the LICENSE file).
+    Reterm is implemented with three kinds of asynchronous threads.  The main
+    thread initializes data structures, accepts connections, and for each
+    session starts a reader thread and a runner thread.  It also cleans up
+    sessions when they end.  The runner thread runs only long enough to start
+    the captive child application, which may be a shell or a console
+    application (such as vim).  The reader thread is the console handler for
+    the child application: it services the console handler packets which
+    arrive from the child, acquires user input and xterm responses, and
+    provides that input to the child when it performs Read() calls.  Because
+    Amiga CLI applications expect a console handler, the full set of console
+    handler packets must be implemented by the reader thread's message loop.
 
     ACTION_READ
         When the application sends an ACTION_READ (DOS library Read() call),
-        the handler will queue this message to be handled by the reader thread.
-        The reader thread processes all input before placing it into the
+        the reader thread queues the packet until input is available.  The
+        reader thread processes all input before placing it into the
         application's read buffer.
