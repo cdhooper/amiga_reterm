@@ -4,11 +4,12 @@
 #     PATH=$PATH:/opt/amiga-gcc/bin
 #     make
 
-VER     ?= 1.1+
+VERSION ?= 1.1+
 
 PROGS   := reterm conperf
 CC      := m68k-amigaos-gcc
-CFLAGS  := -Wall -Wno-pointer-sign -Os -DVER=\"$(VER)\"
+
+CFLAGS  := -Wall -Wno-pointer-sign -Os -DVERSION=\"$(VERSION)\"
 CFLAGS  += -fomit-frame-pointer
 #CFLAGS += -pg   # Generate profile info to gmon.out.  To view:
 #                          m68k-amigaos-gprof reterm gmon.out
@@ -17,6 +18,12 @@ LDFLAGS = -Xlinker -Map=objs/$@.map -mcrt=clib2
 
 #CFLAGS += -g
 #LDFLAGS += -g
+
+BUILD_TIMESTAMP := $(shell date '+%Y-%m-%d %H:%M:%S')
+DATE := $(word 1,$(BUILD_TIMESTAMP))
+TIME := $(word 2,$(BUILD_TIMESTAMP))
+CFLAGS += -DBUILD_DATE=\"$(DATE)\" -DBUILD_TIME=\"$(TIME)\"
+
 
 ifeq (, $(shell which $(CC) 2>/dev/null ))
 $(error "No $(CC) in PATH: maybe do PATH=$$PATH:/opt/amiga/bin")

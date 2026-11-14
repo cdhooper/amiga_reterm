@@ -48,7 +48,7 @@
 
 
 static const char version[] =
-    "\0$VER: reterm " VER " ("__DATE__") \xA9 Chris Hooper";
+    "\0$VER: reterm " VERSION " ("BUILD_DATE" "BUILD_TIME") \xA9 Chris Hooper";
 
 static const char usage[] =
     "\t-a         List abandoned console ports (programs left by a reterm)\n"
@@ -3712,7 +3712,7 @@ append_to_app_input(glob_t *glob, const UBYTE *buf, size_t len)
 }
 
 /*
- * translate_amiga_esc_to_xterm() handles Amiga CSI sequences
+ * translate_amiga_csi_to_xterm() handles Amiga CSI sequences
  * (sent by an Amiga app), converting them to appropriate xterm console
  * sequences.
  */
