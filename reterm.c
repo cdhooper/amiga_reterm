@@ -247,7 +247,8 @@ typedef struct {
     BOOL   support_telnet;        // Enable telnet protocol negotiation
     BOOL   disable_telnet;        // Disable telnet protocol negotiation
     BOOL   support_utf8;          // Convert to/from xterm UTF-8
-    UBYTE  utf8_lead;             // Pending UTF-8 lead byte (0xc2 or 0xc3)
+    UBYTE  utf8_need;             // UTF-8 continuation bytes still expected
+    ULONG  utf8_cp;               // UTF-8 code point being decoded
     BOOL   tab_comp_no_exec_path; // don't show program path on tab
     BOOL   capture_input;         // Capture input to file
     BOOL   capture_output;        // Capture output to file
@@ -6875,15 +6876,48 @@ reader_process_xterm_to_amiga(glob_t *glob)
                 BOOL utf8_decoded = FALSE;
 
                 tab_completion_handle(glob);
-                if (glob->utf8_lead != 0) {
-                    /* Second byte of a UTF-8 sequence U+0080 - U+00FF */
-                    UBYTE lead = glob->utf8_lead;
-                    glob->utf8_lead = 0;
+                if (glob->utf8_need != 0) {
+                    /* Continuation byte of a UTF-8 sequence */
                     if ((cmd & 0xc0) == 0x80) {
-                        cmd = (UBYTE) (((lead & 0x03) << 6) | (cmd & 0x3f));
+                        glob->utf8_cp = (glob->utf8_cp << 6) | (cmd & 0x3f);
+                        if (--glob->utf8_need != 0)
+                            continue;  // More bytes of the sequence follow
+                        /*
+                         * Only ISO 8859-1 printable characters can be given
+                         * to the Amiga.  Others (including C1 controls such
+                         * as 0x9b, which is the Amiga CSI) become '?'.
+                         */
+                        cmd = ((glob->utf8_cp >= 0xa0) &&
+                               (glob->utf8_cp <= 0xff)) ?
+                              (UBYTE) glob->utf8_cp : '?';
+                        utf8_decoded = TRUE;
+                    } else {
+                        glob->utf8_need = 0;  // Invalid: sequence dropped
+                    }
+                }
+                if (glob->support_utf8 && (utf8_decoded == FALSE) &&
+                    (cmd >= 0x80)) {
+                    if ((cmd >= 0xc2) && (cmd <= 0xdf)) {
+                        glob->utf8_need = 1;  // Two-byte sequence
+                        glob->utf8_cp   = cmd & 0x1f;
+                        continue;
+                    }
+                    if ((cmd >= 0xe0) && (cmd <= 0xef)) {
+                        glob->utf8_need = 2;  // Three-byte sequence
+                        glob->utf8_cp   = cmd & 0x0f;
+                        continue;
+                    }
+                    if ((cmd >= 0xf0) && (cmd <= 0xf4)) {
+                        glob->utf8_need = 3;  // Four-byte sequence
+                        glob->utf8_cp   = cmd & 0x07;
+                        continue;
+                    }
+                    if ((cmd != TELNET_IAC) ||
+                        (glob->support_telnet == FALSE)) {
+                        /* Byte which is not valid here in UTF-8 */
+                        cmd = '?';
                         utf8_decoded = TRUE;
                     }
-                    /* else invalid sequence: lead is dropped */
                 }
                 if (glob->wk_eat_nl) {
                     glob->wk_eat_nl = FALSE;
@@ -6901,8 +6935,7 @@ reader_process_xterm_to_amiga(glob_t *glob)
                 if (utf8_decoded) {
                     /*
                      * Decoded character is literal ISO 8859-1 text. It must
-                     * not be interpreted below (e.g. 0xff as telnet IAC,
-                     * 0x9b as CSI, or 0xc2 as another UTF-8 lead byte).
+                     * not be interpreted below (e.g. 0xff as telnet IAC).
                      */
                     goto pass_through;
                 }
@@ -6942,14 +6975,6 @@ reader_process_xterm_to_amiga(glob_t *glob)
                         continue;
                     case 0x7f:  // xterm Backspace
                         cmd = '\b';
-                        break;
-                    case 0xc2:  // UTF-8 lead for U+0080 - U+00BF
-                    case 0xc3:  // UTF-8 lead for U+00C0 - U+00FF
-                        if (glob->support_utf8) {
-                            /* Combine with next byte to form ISO 8859-1 */
-                            glob->utf8_lead = cmd;
-                            continue;
-                        }
                         break;
                     case TELNET_IAC:
                         if (glob->support_telnet) {
@@ -8030,8 +8055,9 @@ skip:
 static BPTR
 open_console_dev(const char *filename, LONG mode)
 {
-    struct FileInfoBlock fib;
-    BPTR                 FH;
+    struct FileInfoBlock *fib;  // Must be longword aligned: not on stack
+    BPTR                  FH;
+    BOOL                  examined;
 
     if (strchr(filename, ':') == NULL)
         return (0);
@@ -8040,7 +8066,14 @@ open_console_dev(const char *filename, LONG mode)
     if (FH == 0)
         return (0);
 
-    if (ExamineFH(FH, &fib) == DOSTRUE) {
+    fib = AllocDosObject(DOS_FIB, NULL);
+    if (fib == NULL) {
+        Close(FH);
+        return (0);
+    }
+    examined = (ExamineFH(FH, fib) == DOSTRUE);
+    FreeDosObject(DOS_FIB, fib);
+    if (examined) {
         Close(FH);
         return (0);  // Should not be able to examine a console FH
     }
@@ -8152,12 +8185,22 @@ handle_connection(glob_t *glob_p, char *runner_cmd)
     sprintf(reader_name, "reterm-reader-%d", glob->client_number);
     sprintf(runner_name, "reterm-runner-%d", glob->client_number);
 
-    /* Start the reader thread first so it can begin waiting for input */
-    CreateNewProcTags(NP_Entry, (ULONG) reader_thread,
-                      NP_Name, (ULONG) reader_name,
-                      NP_StackSize, 8192,  // ^C prompt runs here (vsnprintf)
-                      NP_ExitData, (ULONG) glob,
-                      TAG_END);
+    /*
+     * Start the reader thread first so it can begin waiting for input.
+     * reader_thread_alive is set before the reader starts, so that
+     * handle_task_end() can not free this glob before the reader runs.
+     */
+    glob->reader_thread_alive = TRUE;
+    if (CreateNewProcTags(NP_Entry, (ULONG) reader_thread,
+                          NP_Name, (ULONG) reader_name,
+                          NP_StackSize, 8192,  // ^C prompt runs here
+                          NP_ExitData, (ULONG) glob,
+                          TAG_END) == NULL) {
+        /* Without a reader there is no console for a program to use */
+        warnx("Failed to start reader");
+        glob->reader_thread_alive = FALSE;
+        return (FALSE);
+    }
 
     if (glob->adopt_port != NULL) {
         /* Attaching to an existing program: there is nothing to run */
@@ -8631,16 +8674,62 @@ handle_capture:
         } else if (glob->tcp_port != 0) {
             struct sockaddr_in addr;
             socklen_t len = sizeof (addr);
-            LONG sock = accept(master_sock, (struct sockaddr *) &addr, &len);
+            LONG sock;
+
+            /*
+             * Wait for a connection with a timeout, rather than blocking in
+             * accept(), so that sessions which end are cleaned up (and
+             * their disconnect reported) without waiting for the next
+             * connection.
+             */
+            for (;;) {
+                fd_set         rdset;
+                struct timeval tv;
+                LONG           rc;
+
+                FD_ZERO(&rdset);
+                FD_SET(master_sock, &rdset);
+                tv.tv_sec  = 1;
+                tv.tv_usec = 0;
+                rc = WaitSelect(master_sock + 1, &rdset, NULL, NULL, &tv,
+                                NULL);
+                if ((rc > 0) && FD_ISSET(master_sock, &rdset))
+                    break;  // Connection waiting
+                if (rc < 0) {
+                    LONG error = Errno();
+                    if (error == EINTR) {
+                        /* The socket library consumed the break; restore */
+                        SetSignal(SIGBREAKF_CTRL_C, SIGBREAKF_CTRL_C);
+                    } else {
+                        warnx("WaitSelect failed: %d", error);
+                        if (++accept_fail_count >= 10)
+                            break;
+                        Delay(25);
+                    }
+                }
+                current_count = handle_task_end(glob, FALSE, quiet);
+                handle_signals(glob);
+                if (glob->stopping)
+                    break;
+            }
+            if (glob->stopping || (accept_fail_count >= 10))
+                break;
+
+            sock = accept(master_sock, (struct sockaddr *) &addr, &len);
             if (sock < 0) {
                 LONG error = Errno();
+                if (error == EINTR) {
+                    /* Break: handled by handle_signals() below */
+                    SetSignal(SIGBREAKF_CTRL_C, SIGBREAKF_CTRL_C);
+                    goto no_task_to_run;
+                }
                 warnx("socket accept failed: %d", error);
                 /*
-                 * A break (EINTR) or repeated failure stops reterm. Other
-                 * failures (such as a client which reset the connection
-                 * before it was accepted) are transient.
+                 * Repeated failure stops reterm. Other failures (such as a
+                 * client which reset the connection before it was
+                 * accepted) are transient.
                  */
-                if ((error == EINTR) || (++accept_fail_count >= 10))
+                if (++accept_fail_count >= 10)
                     break;
                 Delay(25);
                 goto no_task_to_run;
