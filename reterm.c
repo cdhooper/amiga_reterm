@@ -208,6 +208,8 @@ typedef struct {
     LONG   adopt_handles;         // Handles found referencing adopt_port
     BOOL   adopted;               // app_cons_msgport is an adopted port
     BOOL   counts_exact;          // open_count counts every console handle
+    BOOL   console_ready;         // Reader has set up the console port
+    BOOL   console_failed;        // Reader failed to set up the console
     BOOL   keep_for_app;          // App still running: keep window and glob
     ULONG  magic;                 // GLOB_MAGIC while valid
     BOOL   kept_unlinked;         // Kept glob removed from reterm's list
@@ -265,6 +267,8 @@ typedef struct {
     BOOL   reader_close_FHs;      // Reader needs to close Filehandles at exit
     LONG   reader_timer_pending;  // Reader timer is active
     BOOL   xterm_request_pending; // App asked for cursor pos / screen size
+    struct DosPacket *size_wait_pkt;  // ACTION_DISK_INFO awaiting window size
+    struct DateStamp  size_wait_ds;   // When the window size was requested
     BOOL   fake_xterm_reply;      // Reply immediately with fake position / size
     BOOL   tab_match_pre_only;    // Tab match only before cursor
     BOOL   tab_have_post_chars;   // Tab name completion is matching post chars
@@ -4276,8 +4280,14 @@ app_to_console(glob_t *glob, UBYTE *buf, LONG count)
                 spos = pos + 1;
                 break;
             case XT_MODE_CSI:  /* ESC [  - CSI sequence */
-                /* Data is buffered until the CSI sequence ends */
-                if (glob->atc_cmdbuf_pos < sizeof (glob->atc_cmdbuf))
+                /*
+                 * Data is buffered until the CSI sequence ends. The last
+                 * buffer byte is reserved for the final byte, so that a too
+                 * long sequence is truncated but still terminated.
+                 */
+                if ((glob->atc_cmdbuf_pos < sizeof (glob->atc_cmdbuf) - 1) ||
+                    ((glob->atc_cmdbuf_pos < sizeof (glob->atc_cmdbuf)) &&
+                     (cmd >= '@') && (cmd <= '}')))
                     glob->atc_cmdbuf[glob->atc_cmdbuf_pos++] = cmd;
                 if ((cmd >= '@' && cmd <= '}')) {
                     /* End of CSI sequence */
@@ -4395,6 +4405,55 @@ fake_window(glob_t *glob)
     return (glob->fake_window);
 }
 
+/* disk_info_fill() fills in the ACTION_DISK_INFO reply */
+static void
+disk_info_fill(glob_t *glob, struct DosPacket *Pkt)
+{
+    struct InfoData *idata = (struct InfoData *) BADDR(Pkt->dp_Arg1);
+    memset(idata, 0, sizeof (*idata));
+    idata->id_DiskType   = glob->raw_mode ? ID_RAWCON : ID_CON;
+    idata->id_VolumeNode = (LONG) fake_window(glob);
+    idata->id_InUse      = (LONG) &glob->id_inuse_req;  // Fake con_unit
+}
+
+/*
+ * size_wait_finish() replies to an ACTION_DISK_INFO which was held while
+ *                    the window size was requested from the terminal.
+ */
+static void
+size_wait_finish(glob_t *glob)
+{
+    struct DosPacket *Pkt = glob->size_wait_pkt;
+
+    if (Pkt == NULL)
+        return;
+    glob->size_wait_pkt = NULL;
+    disk_info_fill(glob, Pkt);
+    Pkt->dp_Res1 = DOSTRUE;
+    Pkt->dp_Res2 = 0;
+    Forbid();
+    PutMsg(Pkt->dp_Port, Pkt->dp_Link);
+    Permit();
+}
+
+/*
+ * size_wait_check() finishes a held ACTION_DISK_INFO if the terminal has
+ *                   not reported its size in time. Called when the xterm
+ *                   timer expires; returns TRUE if still waiting.
+ */
+static BOOL
+size_wait_check(glob_t *glob)
+{
+    if (glob->size_wait_pkt == NULL)
+        return (FALSE);
+    if (ticks_since(&glob->size_wait_ds) < TICKS_PER_SECOND / 2) {
+        xterm_esc_timer_start(glob);  // Keep waiting
+        return (TRUE);
+    }
+    size_wait_finish(glob);  // No reply: use the size last known
+    return (FALSE);
+}
+
 static void
 handle_console_messages(glob_t *glob)
 {
@@ -4433,8 +4492,10 @@ process_pkt:
                     (action == ACTION_FINDOUTPUT) ? "MODE_NEWFILE" :
                     "MODE_READWRITE",
                     (Pkt->dp_Arg3 != 0) ? (char *)BADDR(Pkt->dp_Arg3) : "");
-                if (glob->stopping)
+                if (glob->stopping) {
+                    Res2 = ERROR_OBJECT_NOT_FOUND;  // Session is ending
                     break;
+                }
 
                 glob->open_count++;
                 FH = (struct FileHandle *) BADDR((BPTR)Pkt->dp_Arg1);
@@ -4563,18 +4624,32 @@ process_pkt:
                 Res2 = prev_signal_mp;
                 break;
             }
-            case ACTION_DISK_INFO: {
-                struct InfoData *idata = (struct InfoData *)BADDR(Pkt->dp_Arg1);
+            case ACTION_DISK_INFO:
                 DPRINT1("DISK_INFO");
                 if (glob->stopping)
                     break;
-                memset(idata, 0, sizeof (*idata));
-                idata->id_DiskType   = glob->raw_mode ? ID_RAWCON : ID_CON;
-                idata->id_VolumeNode = (LONG) fake_window(glob);
-                idata->id_InUse = (LONG)&glob->id_inuse_req;  // Fake con_unit
+                if (glob->raw_mode && glob->support_xterm &&
+                    (glob->fake_xterm_reply == FALSE) &&
+                    (glob->size_wait_pkt == NULL)) {
+                    /*
+                     * A program in raw mode (such as vim) gets the window
+                     * size this way. The terminal may have been resized
+                     * since its size was last reported, so ask it, and
+                     * hold this reply until it answers. Otherwise the
+                     * program would start with a stale size, and then be
+                     * sent a resize event when the real size arrives
+                     * (which crashes vim 1.14).
+                     */
+                    xterm_console_emit(glob, STR_ESC "[18t", 5);
+                    glob->size_wait_pkt = Pkt;
+                    DateStamp(&glob->size_wait_ds);
+                    if (glob->xterm_timer_request == NULL)
+                        xterm_esc_timer_start(glob);
+                    continue;  // Replied by size_wait_finish()
+                }
+                disk_info_fill(glob, Pkt);
                 Res1 = DOSTRUE;
                 break;
-            }
             case ACTION_UNDISK_INFO:
                 DPRINT1("UNDISK_INFO");
                 Res1 = DOSTRUE;
@@ -6140,6 +6215,12 @@ cursor_position:
                                                  glob->con_unit.cu_YMax;
                     updated = TRUE;
                 }
+                if (glob->size_wait_pkt != NULL) {
+                    /* The program gets the new size from its DISK_INFO */
+                    size_wait_finish(glob);
+                    updated = FALSE;
+                }
+
                 /* Only propagate this to app when a request was made */
                 if (glob->xterm_request_pending) {
                     glob->xterm_request_pending = FALSE;
@@ -6729,6 +6810,15 @@ xterm_csi_cook_app_input(glob_t *glob, UBYTE cmd, const UBYTE *buf, int len)
                         glob->term_type = TERM_TYPE_XTERM;
                         glob->support_xterm = TRUE;
                         DPRINT1("xterm terminal type");
+                        /*
+                         * Learn the window size now, before any program
+                         * asks for it. Otherwise a program (such as vim)
+                         * may start with the default 80x24 size and then
+                         * be sent a window resize event as soon as the
+                         * real size arrives. Vim 1.14 crashes the Amiga
+                         * when resized that way during startup.
+                         */
+                        xterm_console_emit(glob, STR_ESC "[18t", 5);
                     }
                 }
             }
@@ -6787,7 +6877,9 @@ xterm_esc_timer_start(glob_t *glob)
     struct timerequest *t_req;
     struct MsgPort     *timer_mp = glob->xterm_timer_msgport;
     if (glob->xterm_timer_request != NULL) {
-        warnx("BUG: xterm timer request already outstanding");
+        /* Shared with a window size wait, which may have started it */
+        if (glob->size_wait_pkt == NULL)
+            warnx("BUG: xterm timer request already outstanding");
         return;
     }
     SetSignal(0, glob->xterm_timer_signal);  // Clear previous signal
@@ -6844,6 +6936,7 @@ reader_process_xterm_to_amiga(glob_t *glob)
     UBYTE cmd;
 
     if (xterm_timer_occurred(glob)) {
+        (void) size_wait_check(glob);
         if (wk_esc_timeout(glob)) {
             /* Lone ESC key press canceled the window control prompt */
         } else if (glob->xta_mode == XT_MODE_ESC) {
@@ -7023,8 +7116,14 @@ pass_through:
                 }
                 break;
             case XT_MODE_CSI:
-                /* Data is buffered until the CSI sequence ends */
-                if (glob->xta_cmdbuf_pos < sizeof (glob->xta_cmdbuf))
+                /*
+                 * Data is buffered until the CSI sequence ends. The last
+                 * buffer byte is reserved for the final byte, so that a too
+                 * long sequence is truncated but still terminated.
+                 */
+                if ((glob->xta_cmdbuf_pos < sizeof (glob->xta_cmdbuf) - 1) ||
+                    ((glob->xta_cmdbuf_pos < sizeof (glob->xta_cmdbuf)) &&
+                     (cmd >= '@') && (cmd <= '~')))
                     glob->xta_cmdbuf[glob->xta_cmdbuf_pos++] = cmd;
 
                 if (cmd == KEY_ESC) {
@@ -7603,6 +7702,7 @@ reader_thread(register char *arg, register long len)
 
     reply_mp->mp_Node.ln_Name = "reterm-reader";
     reader_sigmask            = (1 << reply_mp->mp_SigBit);
+    glob->console_ready       = TRUE;  // Runner may now use the console port
     timer_sigmask             = (1 << timer_mp->mp_SigBit);
     xterm_timer_sigmask       = (1 << xterm_timer_mp->mp_SigBit);
     app_cons_sigmask          = (1 << glob->app_cons_msgport->mp_SigBit);
@@ -7820,8 +7920,19 @@ break;
     xterm_timer_cancel(glob);
 
     DPRINT2("reader stopping");
+    size_wait_finish(glob);  // Do not leave the program waiting
 
 fail_exit:
+    if (glob->console_ready == FALSE) {
+        /*
+         * Setup failed: the runner (which waits for console_ready) gives up
+         * when this thread is no longer alive. Mark that now, and wait for
+         * the runner, so that the console port may be deleted below.
+         */
+        glob->console_failed = TRUE;
+        while (glob->runner_thread_alive)
+            Delay(1);
+    }
     if (glob->reader_IFH != 0)
         SetMode(glob->reader_IFH, FALSE);  // Input back to cooked mode
 //  xterm_console_emit(glob, "\r\n", 2);
@@ -7989,6 +8100,17 @@ runner_thread(register char *arg, register long len)
         return (0);
 
     glob->runner_thread_alive = TRUE;
+
+    /* The reader thread creates the console port; wait for it */
+    while (glob->console_ready == FALSE) {
+        if (glob->console_failed || (glob->reader_thread_alive == FALSE)) {
+            Forbid();
+            glob->runner_thread_alive = FALSE;
+            return (0);  // No console: do not start the program
+        }
+        Delay(1);
+    }
+
     IFH = MKBADDR(create_fh(glob, glob->app_cons_msgport));
     OFH = MKBADDR(create_fh(glob, glob->app_cons_msgport));
 
@@ -8052,17 +8174,51 @@ skip:
     return (rc);
 }
 
+/*
+ * is_device_name() returns TRUE if the name (such as "SER:" or "TCP:x/23")
+ *                  refers to a device which is not a filesystem, so it can
+ *                  not be the path of a command to run.
+ */
+static BOOL
+is_device_name(const char *name)
+{
+    struct Process *proc = (struct Process *) FindTask(NULL);
+    const char     *colon = strchr(name, ':');
+    APTR            old_windowptr;
+    char            dev[64];
+    int             len;
+    BOOL            fs;
+
+    if (colon == NULL)
+        return (FALSE);
+    len = colon - name + 1;
+    if (len >= (int) sizeof (dev))
+        return (FALSE);
+    memcpy(dev, name, len);
+    dev[len] = '\0';
+    old_windowptr = proc->pr_WindowPtr;
+    proc->pr_WindowPtr = (APTR) -1;  // No "Please insert volume" requester
+    fs = IsFileSystem(dev);
+    proc->pr_WindowPtr = old_windowptr;
+    return (fs == FALSE);
+}
+
 static BPTR
 open_console_dev(const char *filename, LONG mode)
 {
     struct FileInfoBlock *fib;  // Must be longword aligned: not on stack
+    struct Process       *proc = (struct Process *) FindTask(NULL);
+    APTR                  old_windowptr;
     BPTR                  FH;
     BOOL                  examined;
 
     if (strchr(filename, ':') == NULL)
         return (0);
 
+    old_windowptr = proc->pr_WindowPtr;
+    proc->pr_WindowPtr = (APTR) -1;  // No "Please insert volume" requester
     FH = Open(filename, mode);
+    proc->pr_WindowPtr = old_windowptr;
     if (FH == 0)
         return (0);
 
@@ -8150,6 +8306,8 @@ finish_init:
     glob->kept_prev    = NULL;
     glob->keep_for_app = FALSE;
     glob->counts_exact = FALSE;
+    glob->console_ready = FALSE;
+    glob->console_failed = FALSE;
     glob->fake_window  = NULL;
     glob->con_unit_ptr = &glob->con_unit;
     glob->id_inuse_req.io_Unit = (struct Unit *) &glob->con_unit;
@@ -8387,6 +8545,8 @@ main(int argc, char *argv[])
     int             daemon_count  = 0;
     int             current_count = 0;
     int             accept_fail_count = 0;
+    BOOL            device_mode   = FALSE;  // First argument is a device
+    BOOL            open_warned   = FALSE;  // Reported device open failure
     LONG            attach_cli    = 0;
     int             arg;
 
@@ -8767,6 +8927,20 @@ handle_capture:
                            glob->client_number, first_cmd_arg);
 
                 runner_cmd = runner_cmdbuf + strlen(first_cmd_arg) + 1;
+                device_mode = TRUE;
+                open_warned = FALSE;
+            } else if (device_mode || is_device_name(first_cmd_arg)) {
+                /*
+                 * The device could not be opened (it may be busy). It must
+                 * not be run as a command instead.
+                 */
+                if (open_warned == FALSE)
+                    warnx("Failed to open %s", first_cmd_arg);
+                open_warned = TRUE;
+                if (daemon_count == 0)
+                    break;
+                Delay(50);  // Retry later
+                goto no_task_to_run;
             }
         }
         if (handle_connection(glob, runner_cmd))
