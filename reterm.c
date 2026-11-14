@@ -22,10 +22,16 @@
 #include <rexx/rexxio.h>
 #include <intuition/intuition.h>
 #include <intuition/intuitionbase.h>
+#include <intuition/gadgetclass.h>
+#include <graphics/gfxbase.h>
+#include <graphics/text.h>
+#include <graphics/layers.h>
 #ifdef __lint
 #include <clib/exec_protos.h>
 #include <clib/dos_protos.h>
 #include <clib/intuition_protos.h>
+#include <clib/graphics_protos.h>
+#include <clib/layers_protos.h>
 #include <clib/alib_protos.h>
 #define __NO_NET_API
 #include <clib/bsdsocket_protos.h>
@@ -35,6 +41,8 @@
 #include <inline/dos.h>
 #include <inline/alib.h>
 #include <inline/intuition.h>
+#include <inline/graphics.h>
+#include <inline/layers.h>
 #include <inline/bsdsocket.h>
 #endif
 
@@ -130,12 +138,14 @@ static const char usage[] =
 extern struct Library *SysBase;
 extern struct Library *DOSBase;
 struct Library *IntuitionBase = NULL;
+struct GfxBase *GfxBase       = NULL;  // For gadget label recognition
+struct Library *LayersBase    = NULL;  // For gadget label recognition
 
 BOOL __check_abort_enabled = 0;     // Disable clib2 ^C break handling
 
 /*
  * reterm_exiting is set when the user forces reterm to exit (a second break)
- * while applications still have a reterm console open.  Session reader
+ * while applications still have a reterm console open. Session reader
  * threads then stop waiting for the application to close its console, and
  * leak the console port so that reterm can exit.
  */
@@ -259,6 +269,38 @@ typedef struct {
     BOOL   tab_comp_staged;       // Tab name completion is staged active
     BOOL   tab_comp_running;      // Tab name completion is active
     BOOL   requester_abort_active;  // Next keystroke goes to task window kill
+    UBYTE  wk_level;              // Window control prompt level (WK_*)
+    UBYTE  wk_pass;               // Window found in pass 0 (own) or 1 (helper)
+    UBYTE  wk_menu;               // Selected menu number
+    UBYTE  wk_item;               // Selected (listed) item with sub-items
+    int    wk_helpers;            // Number of helper windows found (pass 1)
+    struct Window *wk_window;     // Window being controlled
+    int    wk_glabels;            // Number of recognized gadget labels
+    struct {
+        struct Gadget *gadget;
+        char           text[24];
+    } wk_glabel[64];              // Labels recognized from gadget pixels
+    UBYTE  wk_page;               // Page of gadget options shown
+    struct {
+        UBYTE  type;              // WK_OPT_*, or WK_OPT_NONE
+        APTR   ptr;               // Gadget, Menu, or MenuItem shown
+        UWORD  id;                // Gadget fingerprint, to detect another
+        UWORD  gtype;             //   gadget allocated at the same address
+        UWORD  activation;
+        APTR   text;
+        APTR   special;
+    } wk_shown[36];               // Option of each key, as shown (WK_MAX_OPTS)
+    APTR   wk_shown_menu;         // Menu whose items are shown
+    APTR   wk_shown_parent;       // Item whose sub-items are shown
+    struct MsgPort *wk_reply_mp;  // Replies to IDCMP messages sent to app
+    int    wk_outstanding;        // IDCMP messages not yet replied
+    struct Gadget *wk_sgad;       // String gadget being edited (WK_TEXT)
+    UWORD  wk_tlen;               // Length of text being entered
+    UWORD  wk_tmax;               // Maximum length of text
+    BOOL   wk_tint;               // Text is for an integer gadget
+    BOOL   wk_eat_nl;             // Discard LF or NUL following CR
+    UBYTE  wk_esc;                // ESC in prompt: WK_ESC_*
+    char   wk_text[256];          // Text being entered for string gadget
     BOOL   no_cooked_esc_sequences; // Use slow method for cooked cmdline
     BOOL   did_query_term_type;     // Sent query for terminal type
     BOOL   did_telnet_linemode;     // Initiated telnet linemode
@@ -521,16 +563,16 @@ get_recent_process(glob_t *glob)
  *
  * When reterm is forced to exit while an application still has its console
  * open, the console message port is left behind (abandoned) with no task to
- * receive packets: mp_Flags is PA_IGNORE and mp_SigTask is NULL.  Older
- * versions of reterm also did this when a client disconnected.  The
- * application then hangs at its next console I/O.  reterm -a lists such
+ * receive packets: mp_Flags is PA_IGNORE and mp_SigTask is NULL. Older
+ * versions of reterm also did this when a client disconnected. The
+ * application then hangs at its next console I/O. reterm -a lists such
  * ports, and reterm -A attaches a new session to one, so that the
  * application may continue.
  */
 
 /*
  * An abandoned port records whether the console was in raw mode, so that
- * a session attaching to it can restore the mode.  The port is private, so
+ * a session attaching to it can restore the mode. The port is private, so
  * its node priority is otherwise unused.
  */
 #define PORT_PRI_RAW_MODE 1
@@ -540,9 +582,9 @@ get_recent_process(glob_t *glob)
  * A kept glob (session state kept for an application which was still
  * running when its session detached) is linked in the session list of the
  * reterm which created it until that reterm's main() notices the session
- * ended.  It may only be freed once it is both unlinked from that list
- * and no longer needed by the application.  Whichever happens last frees
- * it.  The flags are tested and set under Forbid(), as the two may be in
+ * ended. It may only be freed once it is both unlinked from that list
+ * and no longer needed by the application. Whichever happens last frees
+ * it. The flags are tested and set under Forbid(), as the two may be in
  * different reterm processes.
  */
 static void
@@ -600,9 +642,9 @@ task_is_suspended(struct Task *task)
  * proc_port_refs() checks whether a process references a console port,
  *                  through its console task or standard file handles.
  *                  If *portp is NULL, the first abandoned port referenced
- *                  is used and returned in *portp.  The number of distinct
+ *                  is used and returned in *portp. The number of distinct
  *                  file handles referencing the port is returned in
- *                  *handles.  Caller must Forbid().
+ *                  *handles. Caller must Forbid().
  */
 static BOOL
 proc_port_refs(struct Process *proc, struct MsgPort **portp, LONG *handles)
@@ -660,8 +702,8 @@ proc_port_refs(struct Process *proc, struct MsgPort **portp, LONG *handles)
 
 /*
  * port_users() counts the processes referencing a console port, and the
- *              distinct file handles they hold.  Suspended processes are
- *              counted only if count_suspended is TRUE.  Caller must
+ *              distinct file handles they hold. Suspended processes are
+ *              counted only if count_suspended is TRUE. Caller must
  *              Forbid().
  */
 static int
@@ -794,7 +836,7 @@ list_abandoned_ports(void)
                 /*
                  * A non-CLI process (such as the reader thread of a reterm
                  * which was run in the session) inherits the console task
-                 * of its parent.  It can not be attached with -A, so it is
+                 * of its parent. It can not be attached with -A, so it is
                  * shown only if no CLI process uses the same port.
                  */
                 int other;
@@ -822,7 +864,7 @@ list_abandoned_ports(void)
  * claim_abandoned_port() finds the abandoned console port used by the
  *                        specified CLI process, and marks it as claimed
  *                        by this task so that no other reterm will attach
- *                        to it.  The reader thread later takes it over.
+ *                        to it. The reader thread later takes it over.
  */
 static BOOL
 claim_abandoned_port(glob_t *glob, LONG cli_num)
@@ -951,6 +993,39 @@ signal_child(glob_t *glob, ULONG signal_set)
     Permit();
 }
 
+/* unsignal_task() clears signals pending (received but not yet seen) */
+static void
+unsignal_task(struct Task *task, ULONG signal_set)
+{
+    if (is_valid_task(task)) {
+        Disable();  // Signal() may be called from interrupts
+        task->tc_SigRecvd &= ~signal_set;
+        Enable();
+    }
+}
+
+/*
+ * unsignal_child() clears signals sent by signal_child() which the
+ *                  application has not yet seen. This is a little unusual,
+ *                  but a detached application must not be left with a
+ *                  pending break, as many programs (those using the C
+ *                  library's break checking) would then exit without
+ *                  cleanup (leaking windows) at their next stdio call
+ *                  after reattach.
+ */
+static void
+unsignal_child(glob_t *glob, ULONG signal_set)
+{
+    Forbid();
+    if (glob->child_stask_mp != NULL)
+        unsignal_task(glob->child_stask_mp->mp_SigTask, signal_set);
+    if (glob->child_rtask_mp != NULL)
+        unsignal_task(glob->child_rtask_mp->mp_SigTask, signal_set);
+    if (glob->child_wtask_mp != NULL)
+        unsignal_task(glob->child_wtask_mp->mp_SigTask, signal_set);
+    Permit();
+}
+
 static LONG
 do_paste(glob_t *glob, LONG action, LONG buf, LONG len)
 {
@@ -984,7 +1059,7 @@ do_paste(glob_t *glob, LONG action, LONG buf, LONG len)
  * reader_consume() will consume up to the specified number of bytes from
  *                  either the pending read buffer or the paste buffer.
  *                  If the supplied buffer is NULL, this function will
- *                  only report whether bytes are available.  Data is
+ *                  only report whether bytes are available. Data is
  *                  headed to the user application from this function.
  */
 static int
@@ -1122,7 +1197,7 @@ getnum(const char *buf, int *num)
 
 /*
  * tcp_wait_writable() waits for the (non-blocking) reader socket to have
- *                     send buffer space.  It returns FALSE if reterm is
+ *                     send buffer space. It returns FALSE if reterm is
  *                     stopping, in which case the caller should give up.
  *                     The wait is interruptible by stop_readers().
  */
@@ -1188,7 +1263,7 @@ xterm_console_emit_raw(glob_t *glob, const UBYTE *buf, LONG len)
 
 /*
  * telnet_emit() sends a telnet protocol command (which begins with IAC)
- *               to the remote.  It must not be IAC-escaped.
+ *               to the remote. It must not be IAC-escaped.
  */
 static void
 telnet_emit(glob_t *glob, const UBYTE *buf, LONG len)
@@ -1199,7 +1274,7 @@ telnet_emit(glob_t *glob, const UBYTE *buf, LONG len)
 }
 
 /*
- * xterm_console_emit() sends data to the remote terminal.  When the telnet
+ * xterm_console_emit() sends data to the remote terminal. When the telnet
  *                      protocol is active, any data byte of 0xff must be
  *                      sent as IAC IAC (RFC-854), or the remote will
  *                      interpret it and following bytes as a telnet command.
@@ -1234,7 +1309,7 @@ xterm_console_emit(glob_t *glob, const UBYTE *buf, LONG len)
 /*
  * xterm_console_emit_text() sends ISO 8859-1 text (such as the user's
  *                           command line) to the remote terminal, converting
- *                           to UTF-8 if enabled.  Latin-1 0xa0-0xff is
+ *                           to UTF-8 if enabled. Latin-1 0xa0-0xff is
  *                           U+00A0-U+00FF, which is a two-byte sequence.
  */
 static void
@@ -1263,53 +1338,121 @@ xterm_console_emit_text(glob_t *glob, const UBYTE *buf, LONG len)
 }
 
 /*
- * task_window_button_press() sends a button down event for the specified
- *                            gadget in the specified window.
+ * task_window_collect() frees IDCMP messages which the application has
+ *                       replied. If wait_ticks is non-zero, it waits up
+ *                       to that long for outstanding replies. It returns
+ *                       the number of messages still outstanding.
  */
-static void
-task_window_button_press(struct Window *window, struct Gadget *gadget)
+static int
+task_window_collect(glob_t *glob, int wait_ticks)
+{
+    struct Message *msg;
+
+    if (glob->wk_reply_mp == NULL)
+        return (0);
+    for (;;) {
+        while ((msg = GetMsg(glob->wk_reply_mp)) != NULL) {
+            FreeVec(msg);
+            glob->wk_outstanding--;
+        }
+        if ((glob->wk_outstanding <= 0) || (wait_ticks-- <= 0))
+            break;
+        Delay(1);
+    }
+    return (glob->wk_outstanding);
+}
+
+/*
+ * task_window_send() sends an IDCMP message to the specified window, as
+ *                    Intuition would when the user operates a gadget or
+ *                    menu. It does not wait for the reply, as the
+ *                    application may first do console I/O (such as
+ *                    reporting the selection), which this (reader) thread
+ *                    must handle. Replies are collected by
+ *                    task_window_collect().
+ */
+static BOOL wk_window_open(struct Window *target);
+
+/*
+ * wk_input_problem() returns why the window's program can not now receive
+ *                    input from the window, or NULL if it can. A program
+ *                    may delete its IDCMP port (ModifyIDCMP(win, 0)) while
+ *                    busy, or block the window with a requester, which on
+ *                    the Amiga stops gadget and menu input from the user.
+ *                    Caller holds LockIBase().
+ */
+static const char *
+wk_input_problem(struct Window *window)
+{
+    if (window->UserPort == NULL)
+        return ("The program is not accepting input from its window.");
+    if (window->FirstRequest != NULL)
+        return ("The window is blocked by a requester (the program may be "
+                "busy).");
+    return (NULL);
+}
+
+static BOOL
+task_window_send(glob_t *glob, struct Window *window, ULONG class,
+                 UWORD code, APTR iaddress)
 {
     struct IntuiMessage *im;
-    struct MsgPort *reply_mp;
-    im = AllocVec(sizeof (*im), MEMF_PUBLIC);
+    const char          *problem = NULL;
+    ULONG                ilock;
+
+    (void) task_window_collect(glob, 0);
+    if (glob->wk_reply_mp == NULL) {
+        glob->wk_reply_mp = CreateMsgPort();
+        if (glob->wk_reply_mp == NULL) {
+            warnx("Could not create gadget msgport");
+            return (FALSE);
+        }
+    }
+    im = AllocVec(sizeof (*im), MEMF_PUBLIC | MEMF_CLEAR);
     if (im == NULL) {
         warnx("Could not create intuimessage");
-        return;
+        return (FALSE);
     }
-    reply_mp = CreateMsgPort();
-    if (reply_mp == NULL) {
-        warnx("Could not create gadget msgport");
-        FreeVec(im);
-        return;
-    }
-    im->ExecMessage.mn_ReplyPort    = reply_mp;
+    im->ExecMessage.mn_ReplyPort    = glob->wk_reply_mp;
     im->ExecMessage.mn_Length       = sizeof (*im) - sizeof (im->ExecMessage);
     im->ExecMessage.mn_Node.ln_Type = NT_MESSAGE;
-    im->Class       = IDCMP_GADGETUP;
-    im->Code        = 0;
+    im->Class       = class;
+    im->Code        = code;
     im->Qualifier   = 0;  // ie_Qualifier
-    im->IAddress    = gadget;
-    im->MouseX      = 0;  // window->MouseX;
-    im->MouseY      = 0;  // window->MouseY;
+    im->IAddress    = iaddress;
+    im->MouseX      = 0;
+    im->MouseY      = 0;
     im->IDCMPWindow = window;
     im->SpecialLink = NULL;
     CurrentTime(&im->Seconds, &im->Micros);
-    PutMsg(window->UserPort, &im->ExecMessage);
-    WaitPort(reply_mp);
 
-#if 0
-    // Also send up event??
-    if ((window->IDCMPFlags & IDCMP_REQVERIFY) || 1) {
-        im->Class       = IDCMP_GADGETUP;
-        im->Code        = 1;
-        CurrentTime(&im->Seconds, &im->Micros);
+    /*
+     * The window can not close while Intuition is locked, and Forbid()
+     * keeps the program from removing its IDCMP port (or changing what it
+     * accepts) between the check and PutMsg().
+     */
+    ilock = LockIBase(0);
+    Forbid();
+    if (wk_window_open(window) == FALSE)
+        problem = "The window has closed.";
+    else if ((problem = wk_input_problem(window)) != NULL)
+        ;
+    else if ((window->IDCMPFlags & class) == 0)
+        problem = "The program no longer accepts this input.";
+    if (problem == NULL) {
+        glob->wk_outstanding++;
         PutMsg(window->UserPort, &im->ExecMessage);
-        WaitPort(reply_mp);
     }
-#endif
+    Permit();
+    UnlockIBase(ilock);
 
-    DeleteMsgPort(reply_mp);
-    FreeVec(im);
+    if (problem != NULL) {
+        FreeVec(im);
+        xterm_console_emit(glob, (UBYTE *) problem, strlen(problem));
+        xterm_console_emit(glob, (UBYTE *) " Nothing was sent.\r\n", 20);
+        return (FALSE);
+    }
+    return (TRUE);
 }
 
 static int __regargs
@@ -1325,15 +1468,22 @@ static UBYTE *
 gadget_label(struct Gadget *gadget)
 {
     struct IntuiText *it;
+    UBYTE            *str;
     switch (gadget->Flags & GFLG_LABELMASK) {
         case GFLG_LABELSTRING:
-            return ((UBYTE *) gadget->GadgetText);
+            str = (UBYTE *) gadget->GadgetText;
+            break;
         case GFLG_LABELITEXT:
-            it = gadget->GadgetText;
-            return ((it != NULL) ? it->IText : NULL);
+            it  = gadget->GadgetText;
+            str = (it != NULL) ? it->IText : NULL;
+            break;
         default:  // GFLG_LABELIMAGE: GadgetText is an Image
-            return (NULL);
+            str = NULL;
+            break;
     }
+    if ((str != NULL) && (str[0] == '\0'))
+        str = NULL;  // Empty label (such as GadTools MX items)
+    return (str);
 }
 
 /*
@@ -1392,7 +1542,7 @@ dup_path_list(BPTR list)
  *                           suspended at the "Software Failure" requester.
  *                           The suspended process will never close its
  *                           console handles, so those are counted as
- *                           orphaned.  The new shell inherits the command
+ *                           orphaned. The new shell inherits the command
  *                           path and current directory of the old one.
  */
 static void
@@ -1458,7 +1608,7 @@ replace_suspended_shell(glob_t *glob, struct Process *proc)
 
 /*
  * is_requester_helper() returns TRUE if the specified task opens requester
- *                       windows on behalf of other programs.  The AmigaOS 3.2
+ *                       windows on behalf of other programs. The AmigaOS 3.2
  *                       AssignWedge task opens the "Volume Request" window
  *                       which would otherwise be opened by the program.
  *                       Caller must hold LockIBase() or Forbid().
@@ -1474,176 +1624,2062 @@ is_requester_helper(struct Task *task)
 }
 
 /*
- * task_window_kill() will prompt the user to kill (by gadget selection) a
- *                    window opened by the child application.  This is mostly
- *                    useful to terminate requesters which have popped up so
- *                    the program can continue.
+ * Window control prompt
+ *
+ * When the requester abort key (^C) is pressed and the application has a
+ * window open, the user is prompted to select one of the window's buttons,
+ * one of its title bar gadgets, or its menu. Selecting the menu lists the
+ * menu titles, then the items (and sub-items) of the selected menu.
+ * Backspace returns to the previous list, and ESC cancels the prompt.
+ */
+#define WK_GADGETS    1  // Buttons, title bar gadgets and menu
+#define WK_MENUS      2  // Menu titles
+#define WK_ITEMS      3  // Items of the selected menu
+#define WK_SUBITEMS   4  // Sub-items of the selected item
+#define WK_TEXT       5  // Entering text for a string gadget
+
+#define WK_OPT_GADGET 0  // Button gadget
+#define WK_OPT_CLOSE  1  // Title bar close gadget
+#define WK_OPT_DEPTH  2  // Title bar depth gadget
+#define WK_OPT_ZOOM   3  // Title bar zoom gadget
+#define WK_OPT_MENU   4  // Menu strip
+#define WK_OPT_STRING 5  // String or integer gadget
+#define WK_OPT_NONE   0xff  // No option for this key
+
+#define WK_ESC_NONE   0
+#define WK_ESC_WAIT   1  // ESC received; waiting to see if a sequence follows
+#define WK_ESC_SEQ    2  // Discarding a cursor or function key sequence
+
+#define WK_ACT_NONE   0
+#define WK_ACT_FRONT  1  // WindowToFront()
+#define WK_ACT_BACK   2  // WindowToBack()
+#define WK_ACT_ZOOM   3  // ZipWindow()
+
+#define WK_MAX_OPTS   36  // Keys available (menus and items)
+#define WK_GAD_KEYS   26  // Keys for gadget options (A-Z)
+#define WK_KEY_MENU   25  // 'Z' is always [Menu], if the window has one
+#define WK_BUF_SIZE   4096
+static const char wk_keys[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+
+typedef struct {
+    UBYTE          type;    // WK_OPT_*
+    struct Gadget *gadget;
+} wk_opt_t;
+
+typedef struct {
+    char *buf;
+    int   len;
+} wk_buf_t;
+
+static BOOL
+wk_buf_init(wk_buf_t *wb)
+{
+    wb->len = 0;
+    wb->buf = AllocVec(WK_BUF_SIZE, MEMF_ANY);
+    return (wb->buf != NULL);
+}
+
+__attribute__((format(printf, 2, 3)))
+static void
+wk_add(wk_buf_t *wb, const char *fmt, ...)
+{
+    va_list ap;
+    int     count;
+
+    if (wb->len >= WK_BUF_SIZE - 1)
+        return;
+    va_start(ap, fmt);
+    count = vsnprintf(wb->buf + wb->len, WK_BUF_SIZE - wb->len, fmt, ap);
+    va_end(ap);
+    if (count > 0)
+        wb->len += count;
+    if (wb->len > WK_BUF_SIZE - 1)
+        wb->len = WK_BUF_SIZE - 1;
+}
+
+static void
+wk_buf_emit(glob_t *glob, wk_buf_t *wb)
+{
+    if (wb->len > 0)
+        xterm_console_emit(glob, (UBYTE *) wb->buf, wb->len);
+    FreeVec(wb->buf);
+    wb->buf = NULL;
+}
+
+static void xterm_esc_timer_start(glob_t *glob);
+static void xterm_timer_cancel(glob_t *glob);
+
+static void
+wk_reset(glob_t *glob)
+{
+    if (glob->wk_esc == WK_ESC_WAIT)
+        xterm_timer_cancel(glob);
+    glob->wk_esc = WK_ESC_NONE;
+    glob->requester_abort_active = FALSE;
+    glob->wk_level  = 0;
+    glob->wk_window = NULL;
+    glob->wk_sgad   = NULL;
+}
+
+/* is_button_gadget() returns TRUE for a (non-system) button gadget */
+static BOOL
+is_button_gadget(struct Gadget *gadget)
+{
+    ULONG gtype = gadget->GadgetType;
+    return (((gtype & GTYP_GADGETTYPE) == 0) &&
+            (((gtype & GTYP_GTYPEMASK) == GTYP_CUSTOMGADGET) ||
+             ((gtype & GTYP_GTYPEMASK) == GTYP_BOOLGADGET)));
+}
+
+/*
+ * is_toggle_gadget() returns TRUE for a gadget which has a selected state:
+ *                    a toggle (such as a checkbox), or one which only
+ *                    reports being pressed (such as a GadTools MX item).
  */
 static BOOL
-task_window_kill(glob_t *glob, UBYTE cmd)
+is_toggle_gadget(struct Gadget *gadget)
 {
-    ULONG                 ilock;
-    int                   gadget_count;
-    int                   gadget_want = 0;
-    struct Screen        *screen;
-    struct Window        *window = NULL;
-    struct Window        *cwindow;
-    struct Gadget        *gadget;
-    struct Gadget        *gadget_wanted = NULL;
-    int                   pass;
-    int                   helper_windows = 0;
-    struct Gadget        *firstgadget = NULL;
-    struct Task          *task = (struct Task *) get_recent_process(glob);
-    struct IntuitionBase *ibase = (struct IntuitionBase *) IntuitionBase;
+    return ((gadget->Activation & GACT_TOGGLESELECT) ||
+            (((gadget->Activation & GACT_RELVERIFY) == 0) &&
+             (gadget->Activation & GACT_IMMEDIATE)));
+}
 
-    if (glob->requester_abort_active) {
-        if ((cmd >= 'a') && (cmd <= 'z'))
-            cmd = cmd - 'a' + 'A';
-        if ((cmd < 'A') || (cmd > 'Z')) {
-            /* Invalid key press -- abort */
-            xterm_console_emit(glob, "taking no action\r\n", 18);
-            glob->requester_abort_active = FALSE;
-            return (TRUE);
+/* is_string_gadget() returns TRUE for a (non-system) string gadget */
+static BOOL
+is_string_gadget(struct Gadget *gadget)
+{
+    ULONG              gtype = gadget->GadgetType;
+    struct StringInfo *si    = (struct StringInfo *) gadget->SpecialInfo;
+    return (((gtype & GTYP_GADGETTYPE) == 0) &&
+            ((gtype & GTYP_GTYPEMASK) == GTYP_STRGADGET) &&
+            (si != NULL) && (si->Buffer != NULL) && (si->MaxChars > 0));
+}
+
+/*
+ * window_options() returns the number of options which a window offers:
+ *                  title bar gadgets, then button and string gadgets,
+ *                  then the menu
+ *                  (always last). If want is a valid option number, that
+ *                  option is returned in *opt. Caller holds LockIBase().
+ */
+static int
+window_options(struct Window *window, int want, wk_opt_t *opt)
+{
+    struct Gadget *gadget;
+    int            count = 0;
+    int            pass;
+
+    for (pass = 0; pass < 2; pass++) {
+        for (gadget = window->FirstGadget; gadget != NULL;
+             gadget = gadget->NextGadget) {
+            UBYTE type;
+            if (count >= 250)
+                break;
+            if (pass == 1) {
+                if (is_button_gadget(gadget))
+                    type = WK_OPT_GADGET;
+                else if (is_string_gadget(gadget))
+                    type = WK_OPT_STRING;
+                else
+                    continue;
+            } else {
+                if ((gadget->GadgetType & GTYP_SYSGADGET) == 0)
+                    continue;
+                switch (gadget->GadgetType & GTYP_SYSTYPEMASK) {
+                    case GTYP_CLOSE:
+                        /* The close gadget does nothing without this */
+                        if ((window->IDCMPFlags & IDCMP_CLOSEWINDOW) == 0)
+                            continue;
+                        type = WK_OPT_CLOSE;
+                        break;
+                    case GTYP_WDEPTH:
+                        type = WK_OPT_DEPTH;
+                        break;
+                    case GTYP_WZOOM:
+                        type = WK_OPT_ZOOM;
+                        break;
+                    default:  // Sizing and drag bar gadgets
+                        continue;
+                }
+            }
+            if (count == want) {
+                opt->type   = type;
+                opt->gadget = gadget;
+            }
+            count++;
         }
-        gadget_want = cmd - 'A';
     }
-
-    if (is_valid_task(task) == FALSE) {
-        warnx("winkill %p: invalid task", task);
-        glob->requester_abort_active = FALSE;
-        return (TRUE);
+    if (window->MenuStrip != NULL) {
+        if (count == want) {
+            opt->type   = WK_OPT_MENU;
+            opt->gadget = NULL;
+        }
+        count++;
     }
+    return (count);
+}
 
-    /*
-     * Pass 0 looks for a window opened by the application itself (such as
-     * a DOS "System Request").  If there is none, pass 1 looks for a window
-     * opened on the application's behalf by a requester helper task, such
-     * as the AmigaOS 3.2 AssignWedge "Volume Request".  Such a window can
-     * not be tied to a specific application, so more than one may be open.
-     * Pass 1 is skipped if the application is waiting on console I/O, as
-     * it then can not be waiting on a requester.
-     */
-    ilock = LockIBase(0);
+/*
+ * wk_find_window() finds the window of the application to control.
+ *                  Caller holds LockIBase().
+ *
+ * Pass 0 looks for a window opened by the application itself (such as a
+ * DOS "System Request"). If there is none, pass 1 looks for a window
+ * opened on the application's behalf by a requester helper task, such as
+ * the AmigaOS 3.2 AssignWedge "Volume Request". Such a window can not be
+ * tied to a specific application, so more than one may be open. Pass 1
+ * is skipped if the application is waiting on console I/O, as it then can
+ * not be waiting on a requester.
+ */
+static struct Window *
+wk_find_window(glob_t *glob, struct Task *task, int *passp, int *countp)
+{
+    struct IntuitionBase *ibase = (struct IntuitionBase *) IntuitionBase;
+    struct Screen        *screen;
+    struct Window        *window;
+    struct Window        *found = NULL;
+    int                   count;
+    int                   pass;
+
     for (pass = 0; pass < 2; pass++) {
         if ((pass == 1) &&
             ((glob->pending_reads.lh_Head->ln_Succ != NULL) ||
              (glob->pending_app_packet != NULL)))
             break;
+        count = 0;
         for (screen = ibase->FirstScreen; screen != NULL;
              screen = screen->NextScreen) {
-            for (cwindow = screen->FirstWindow; cwindow != NULL;
-                 cwindow = cwindow->NextWindow) {
+            for (window = screen->FirstWindow; window != NULL;
+                 window = window->NextWindow) {
                 struct Task *owner;
-                if (cwindow->UserPort == NULL)
+                if (window->UserPort == NULL)
                     continue;
-                owner = (struct Task *) cwindow->UserPort->mp_SigTask;
+                owner = (struct Task *) window->UserPort->mp_SigTask;
                 if ((pass == 0) ? (owner != task) :
                                   (is_requester_helper(owner) == FALSE))
                     continue;
-                for (gadget = cwindow->FirstGadget; gadget != NULL;
-                     gadget = gadget->NextGadget) {
-                    ULONG gtype = gadget->GadgetType;
-                    if (((gtype & GTYP_GADGETTYPE) == 0) &&
-                        (((gtype & GTYP_GTYPEMASK) == GTYP_CUSTOMGADGET) ||
-                         ((gtype & GTYP_GTYPEMASK) == GTYP_BOOLGADGET))) {
-                        if (firstgadget == NULL) {
-                            /* First (most recent) matching window */
-                            firstgadget = gadget;
-                            window = cwindow;
-                        }
-                        helper_windows++;
+                if (window_options(window, -1, NULL) == 0)
+                    continue;
+                if (found == NULL)
+                    found = window;  // First (most recent) matching window
+                count++;
+            }
+        }
+        if (found != NULL) {
+            *passp  = pass;
+            *countp = count;
+            return (found);
+        }
+    }
+    return (NULL);
+}
+
+/* wk_window_open() verifies the window is still open (holds LockIBase) */
+static BOOL
+wk_window_open(struct Window *target)
+{
+    struct IntuitionBase *ibase = (struct IntuitionBase *) IntuitionBase;
+    struct Screen        *screen;
+    struct Window        *window;
+
+    for (screen = ibase->FirstScreen; screen != NULL;
+         screen = screen->NextScreen)
+        for (window = screen->FirstWindow; window != NULL;
+             window = window->NextWindow)
+            if (window == target)
+                return (TRUE);
+    return (FALSE);
+}
+
+static struct Menu *
+wk_nth_menu(struct Menu *menu, int want)
+{
+    while ((menu != NULL) && (want-- > 0))
+        menu = menu->NextMenu;
+    return (menu);
+}
+
+/* wk_item_listed() is FALSE for separator bars (disabled image items) */
+static BOOL
+wk_item_listed(struct MenuItem *item)
+{
+    return ((item->Flags & (ITEMTEXT | ITEMENABLED)) != 0);
+}
+
+/*
+ * wk_nth_item() returns the want'th listed item, and its position in the
+ *               item list (as used for the menu number) in *realp.
+ */
+static struct MenuItem *
+wk_nth_item(struct MenuItem *item, int want, int *realp)
+{
+    int real   = 0;
+    int listed = 0;
+    for (; item != NULL; item = item->NextItem, real++) {
+        if (wk_item_listed(item) == FALSE)
+            continue;
+        if (listed++ == want) {
+            *realp = real;
+            return (item);
+        }
+    }
+    return (NULL);
+}
+
+/*
+ * Gadget label recognition
+ *
+ * Some programs draw button labels directly into the window (or as an
+ * image) rather than giving the gadget a text label. Such text is drawn
+ * with a bitmap font without anti-aliasing, so the pixels in the gadget
+ * box exactly match the font glyphs. The pixels are read back from the
+ * window, and for each candidate font, row offset and text pen, matched
+ * against the glyph bitmaps of the font.
+ *
+ * Pixels which may not belong to the text are "wild" (ignored): the top
+ * and bottom rows and two edge columns of the gadget box, where its frame
+ * is drawn, and for a disabled gadget, the lattice of Intuition's ghosting
+ * dot pattern (every fourth pixel, offset by two on alternate rows).
+ *
+ * For speed, glyphs are indexed by their first column which has ink
+ * outside the wild rows, and the glyph matching at each position is found
+ * once and then followed to decode lines of text.
+ */
+#define GR_MAX_W     320  // Largest gadget box examined
+#define GR_MAX_H     40
+#define GR_MAX_PENS  4    // Number of candidate text pens tried
+#define GR_EDGE      2    // Text may not touch this many edge columns
+#define GR_MAX_FONTS 3
+
+typedef struct {
+    WORD  d;              // Column offset (kern + column) from origin
+    UWORD ch;             // Glyph number
+    ULONG key;            // Non-wild bits of that column
+} gr_ent_t;
+
+typedef struct {
+    int       lo;         // First character
+    int       count;      // Number of characters
+    int       ysize;
+    int       xsize;
+    ULONG    *mask;       // Column masks of all glyphs (bit 0 = top row)
+    UWORD    *start;      // Index of first column mask of each glyph
+    UBYTE    *width;      // Glyph bit width
+    UBYTE    *ink;        // Number of set pixels (match preference)
+    UBYTE    *ink_first;  // First column with ink (0xff if none)
+    UBYTE    *ink_last;   // Last column with ink
+    WORD     *kern;
+    WORD     *space;
+    gr_ent_t *ent;        // Index, sorted by d then key
+    int       nent;
+    WORD      dlist[32];  // Distinct d values in the index
+    int       nd;
+    ULONG     index_rmask;  // Wild row mask the index was built for
+    BOOL      index_valid;
+} gr_font_t;
+
+typedef struct {
+    gr_font_t *fonts[GR_MAX_FONTS];
+    int        nfonts;
+    UBYTE     *pix;       // Pixel pens of the gadget box
+    ULONG     *col;       // Text pen column masks
+    ULONG     *wild;      // Wild (ignored) bits of each column
+    WORD      *gat;       // Glyph matching at each origin, or -1
+    ULONG     *hist;      // Pen histogram
+} gr_ctx_t;
+
+typedef struct {
+    WORD left;
+    WORD top;
+    WORD width;
+    WORD height;
+    BOOL disabled;
+} gr_box_t;
+
+/* gr_font_load() builds glyph column masks for a font */
+static gr_font_t *
+gr_font_load(struct TextFont *tf)
+{
+    gr_font_t *f;
+    ULONG     *loc;
+    UBYTE     *data;
+    int        count;
+    int        cols = 0;
+    int        ch;
+    UBYTE     *mem;
+
+    if ((tf == NULL) || (tf->tf_YSize < 4) || (tf->tf_YSize > 32) ||
+        (tf->tf_CharData == NULL) || (tf->tf_CharLoc == NULL) ||
+        (tf->tf_HiChar < tf->tf_LoChar))
+        return (NULL);
+    count = tf->tf_HiChar - tf->tf_LoChar + 1;
+    loc   = (ULONG *) tf->tf_CharLoc;
+    data  = (UBYTE *) tf->tf_CharData;
+    for (ch = 0; ch < count; ch++) {
+        int width = loc[ch] & 0xffff;
+        if (width <= 32)
+            cols += width;
+    }
+    mem = AllocVec(sizeof (*f) + count * sizeof (gr_ent_t) +
+                   cols * sizeof (ULONG) +
+                   count * (sizeof (UWORD) + 2 * sizeof (WORD) + 4) + 4,
+                   MEMF_ANY | MEMF_CLEAR);
+    if (mem == NULL)
+        return (NULL);
+    f            = (gr_font_t *) mem;
+    f->ent       = (gr_ent_t *) (mem + sizeof (*f));
+    f->mask      = (ULONG *) (f->ent + count);
+    f->kern      = (WORD *) (f->mask + cols);
+    f->space     = f->kern + count;
+    f->start     = (UWORD *) (f->space + count);
+    f->width     = (UBYTE *) (f->start + count);
+    f->ink       = f->width + count;
+    f->ink_first = f->ink + count;
+    f->ink_last  = f->ink_first + count;
+    f->lo        = tf->tf_LoChar;
+    f->count     = count;
+    f->ysize     = tf->tf_YSize;
+    f->xsize     = tf->tf_XSize;
+
+    cols = 0;
+    for (ch = 0; ch < count; ch++) {
+        ULONG off   = loc[ch] >> 16;
+        int   width = loc[ch] & 0xffff;
+        int   col;
+        int   row;
+        int   ink = 0;
+
+        if (width > 32)
+            width = 0;
+        f->start[ch]     = cols;
+        f->width[ch]     = width;
+        f->ink_first[ch] = 0xff;
+        f->kern[ch]      = (tf->tf_CharKern != NULL) ?
+                           ((WORD *) tf->tf_CharKern)[ch] : 0;
+        f->space[ch]     = ((tf->tf_Flags & FPF_PROPORTIONAL) &&
+                            (tf->tf_CharSpace != NULL)) ?
+                           ((WORD *) tf->tf_CharSpace)[ch] : tf->tf_XSize;
+        for (col = 0; col < width; col++) {
+            ULONG bit  = off + col;
+            ULONG mask = 0;
+            for (row = 0; row < f->ysize; row++) {
+                if (data[row * tf->tf_Modulo + (bit >> 3)] &
+                    (0x80 >> (bit & 7))) {
+                    mask |= 1UL << row;
+                    ink++;
+                }
+            }
+            f->mask[cols + col] = mask;
+            if (mask != 0) {
+                if (f->ink_first[ch] == 0xff)
+                    f->ink_first[ch] = col;
+                f->ink_last[ch] = col;
+            }
+        }
+        f->ink[ch] = (ink > 255) ? 255 : ink;
+        cols += width;
+    }
+    return (f);
+}
+
+/*
+ * gr_index_build() indexes the glyphs by their first column with ink
+ *                  outside the wild rows (rmask).
+ */
+static void
+gr_index_build(gr_font_t *f, ULONG rmask)
+{
+    int ch;
+    int cur;
+
+    if (f->index_valid && (f->index_rmask == rmask))
+        return;
+    f->nent = 0;
+    f->nd   = 0;
+    for (ch = 0; ch < f->count; ch++) {
+        ULONG *gm = f->mask + f->start[ch];
+        int    c;
+        for (c = 0; c < f->width[ch]; c++) {
+            if (gm[c] & ~rmask) {
+                gr_ent_t ent;
+                int      pos = f->nent++;
+                ent.d   = f->kern[ch] + c;
+                ent.ch  = ch;
+                ent.key = gm[c] & ~rmask;
+                /* Insertion sort by d, then key */
+                while ((pos > 0) &&
+                       ((f->ent[pos - 1].d > ent.d) ||
+                        ((f->ent[pos - 1].d == ent.d) &&
+                         (f->ent[pos - 1].key > ent.key)))) {
+                    f->ent[pos] = f->ent[pos - 1];
+                    pos--;
+                }
+                f->ent[pos] = ent;
+                break;
+            }
+        }
+    }
+    for (cur = 0; cur < f->nent; cur++) {
+        if (((cur == 0) || (f->ent[cur].d != f->ent[cur - 1].d)) &&
+            (f->nd < 32))
+            f->dlist[f->nd++] = f->ent[cur].d;
+    }
+    f->index_rmask = rmask;
+    f->index_valid = TRUE;
+}
+
+/*
+ * gr_verify() returns TRUE if glyph ch exactly matches (ignoring wild
+ *             bits) with its origin at x, and has ink outside wild bits.
+ */
+static BOOL
+gr_verify(gr_font_t *f, int ch, const ULONG *col, const ULONG *wild,
+          int width, int x)
+{
+    ULONG *gm = f->mask + f->start[ch];
+    ULONG  ink = 0;
+    int    gx = x + f->kern[ch];
+    int    c;
+
+    if ((gx < 0) || (gx + f->width[ch] > width))
+        return (FALSE);
+    for (c = 0; c < f->width[ch]; c++) {
+        ULONG wm = wild[gx + c];
+        if ((col[gx + c] ^ gm[c]) & ~wm)
+            return (FALSE);
+        ink |= gm[c] & ~wm;
+    }
+    return (ink != 0);
+}
+
+/*
+ * gr_glyph_at() returns the glyph (preferring the most ink) which matches
+ *               with its origin at x, or -1. If rmask is not ~0, the
+ *               index is used: wild bits of non-edge columns must then be
+ *               exactly rmask.
+ */
+static int
+gr_glyph_at(gr_font_t *f, const ULONG *col, const ULONG *wild, int width,
+            int x, BOOL indexed)
+{
+    int best     = -1;
+    int best_ink = 0;
+    int ch;
+
+    if (indexed == FALSE) {
+        for (ch = 0; ch < f->count; ch++) {
+            if ((f->ink[ch] > best_ink) &&
+                gr_verify(f, ch, col, wild, width, x)) {
+                best     = ch;
+                best_ink = f->ink[ch];
+            }
+        }
+        return (best);
+    }
+    for (ch = 0; ch < f->nd; ch++) {
+        int   d  = f->dlist[ch];
+        int   px = x + d;
+        ULONG key;
+        int   low;
+        int   high;
+        if ((px < 0) || (px >= width) || (wild[px] != f->index_rmask))
+            continue;  // Edge column: glyph would be rejected anyway
+        key = col[px] & ~f->index_rmask;
+        if (key == 0)
+            continue;
+        /* Binary search for the first entry with (d, key) */
+        low  = 0;
+        high = f->nent;
+        while (low < high) {
+            int       mid = (low + high) / 2;
+            gr_ent_t *e   = &f->ent[mid];
+            if ((e->d < d) || ((e->d == d) && (e->key < key)))
+                low = mid + 1;
+            else
+                high = mid;
+        }
+        for (; (low < f->nent) && (f->ent[low].d == d) &&
+               (f->ent[low].key == key); low++) {
+            int gch = f->ent[low].ch;
+            if ((f->ink[gch] > best_ink) &&
+                gr_verify(f, gch, col, wild, width, x)) {
+                best     = gch;
+                best_ink = f->ink[gch];
+            }
+        }
+    }
+    return (best);
+}
+
+/*
+ * gr_decode_rows() finds the text with the most characters in the pixels
+ *                  of the specified pen at row offset y0.
+ */
+static int
+gr_decode_rows(gr_ctx_t *ctx, gr_font_t *f, int width, int height, int y0,
+               UBYTE pen, int ghost, char *out, int outlen)
+{
+    const UBYTE *pix  = ctx->pix;
+    ULONG       *col  = ctx->col;
+    ULONG       *wild = ctx->wild;
+    WORD        *gat  = ctx->gat;
+    ULONG        rmask = 0;
+    int          best  = 0;
+    int          step  = f->xsize;
+    int          row;
+    int          x;
+
+    for (row = 0; row < f->ysize; row++)
+        if ((y0 + row == 0) || (y0 + row == height - 1))
+            rmask |= 1UL << row;  // Frame rows
+    if (ghost < 0)
+        gr_index_build(f, rmask);
+    if ((' ' >= f->lo) && (' ' < f->lo + f->count) &&
+        (f->space[' ' - f->lo] > 0))
+        step = f->space[' ' - f->lo];
+
+    for (x = 0; x < width; x++) {
+        ULONG mask  = 0;
+        ULONG wmask = rmask;
+        for (row = 0; row < f->ysize; row++) {
+            int y = y0 + row;
+            if (pix[y * width + x] == pen)
+                mask |= 1UL << row;
+            if ((ghost >= 0) && (((x + ghost + 2 * (y & 1)) & 3) == 0))
+                wmask |= 1UL << row;
+        }
+        if ((x < GR_EDGE) || (x >= width - GR_EDGE))
+            wmask = ~0UL;  // Frame columns
+        col[x]  = mask;
+        wild[x] = wmask;
+    }
+    for (x = 0; x < width; x++)
+        gat[x] = gr_glyph_at(f, col, wild, width, x, (ghost < 0));
+
+    /* Follow matched glyphs from each origin to decode lines of text */
+    for (x = 0; x < width; x++) {
+        char text[24];
+        int  len    = 0;
+        int  chars  = 0;
+        int  spaces = 0;
+        int  left   = width;
+        int  right  = 0;
+        int  pos    = x;
+
+        if (gat[x] < 0)
+            continue;
+        while ((pos < width) && (len + spaces < (int) sizeof (text) - 1)) {
+            int ch = gat[pos];
+            if (ch >= 0) {
+                int gx = pos + f->kern[ch];
+                while (spaces > 0) {
+                    text[len++] = ' ';
+                    spaces--;
+                }
+                text[len++] = (char) (f->lo + ch);
+                chars++;
+                if (gx + f->ink_first[ch] < left)
+                    left = gx + f->ink_first[ch];
+                if (gx + f->ink_last[ch] + 1 > right)
+                    right = gx + f->ink_last[ch] + 1;
+                pos += (f->space[ch] > 0) ? f->space[ch] : f->xsize;
+            } else {
+                /* A space is an empty cell */
+                int c;
+                if ((spaces >= 2) || (pos + step > width))
+                    break;
+                for (c = pos; c < pos + step; c++)
+                    if (col[c] & ~wild[c])
                         break;
-                    }
+                if (c < pos + step)
+                    break;  // Unrecognized ink
+                spaces++;
+                pos += step;
+            }
+        }
+        text[len] = '\0';
+        if ((left < GR_EDGE) || (right > width - GR_EDGE))
+            continue;  // Touches the frame
+        if (chars > best) {
+            best = chars;
+            strncpy(out, text, outlen);
+            out[outlen - 1] = '\0';
+        }
+    }
+    return (best);
+}
+
+/*
+ * gr_recognize() decodes the label of one gadget box from its pixels
+ *                (already in ctx->pix). It returns TRUE if text was found.
+ */
+static BOOL
+gr_recognize(gr_ctx_t *ctx, int width, int height, BOOL disabled, char *out,
+             int outlen)
+{
+    const UBYTE *pix   = ctx->pix;
+    ULONG       *count = ctx->hist;
+    UBYTE        pens[GR_MAX_PENS];
+    int          npens = 0;
+    int          best  = 0;
+    int          ghost = -1;  // Ghosting pattern phase, if disabled
+    int          pos;
+    int          pen;
+    int          font;
+
+    if (disabled) {
+        /* Find the phase where (nearly) all lattice pixels are one pen */
+        int phase;
+        for (phase = 0; phase < 4; phase++) {
+            int total = 0;
+            int x;
+            int y;
+            memset(count, 0, 256 * sizeof (ULONG));
+            for (y = 0; y < height; y++) {
+                for (x = (8 - phase - 2 * (y & 1)) & 3; x < width; x += 4) {
+                    count[pix[y * width + x]]++;
+                    total++;
+                }
+            }
+            for (pen = 0; pen < 256; pen++)
+                if ((total > 0) && (count[pen] * 10 >= (ULONG) total * 9))
+                    ghost = phase;
+            if (ghost >= 0)
+                break;
+        }
+    }
+
+    /*
+     * Candidate text pens are the most common pens. The most common pen
+     * is usually the background, but bold text with a border may have
+     * more pixels than the background.
+     */
+    memset(count, 0, 256 * sizeof (ULONG));
+    for (pos = 0; pos < width * height; pos++)
+        count[pix[pos]]++;
+    while (npens < GR_MAX_PENS) {
+        int most = -1;
+        for (pen = 0; pen < 256; pen++)
+            if ((count[pen] != 0) && ((most < 0) || (count[pen] > count[most])))
+                most = pen;
+        if ((most < 0) || (count[most] < 2))
+            break;
+        pens[npens++] = most;
+        count[most]   = 0;
+    }
+
+    for (font = 0; font < ctx->nfonts; font++) {
+        gr_font_t *f = ctx->fonts[font];
+        int        y0;
+        for (y0 = 0; y0 + f->ysize <= height; y0++) {
+            for (pen = 0; pen < npens; pen++) {
+                char text[24];
+                int  chars = gr_decode_rows(ctx, f, width, height, y0,
+                                            pens[pen], ghost, text,
+                                            sizeof (text));
+                if (chars > best) {
+                    best = chars;
+                    strncpy(out, text, outlen);
+                    out[outlen - 1] = '\0';
                 }
             }
         }
-        if (firstgadget != NULL)
+    }
+    return (best > 0);
+}
+
+static void
+gr_ctx_free(gr_ctx_t *ctx)
+{
+    int cur;
+    if (ctx == NULL)
+        return;
+    for (cur = 0; cur < ctx->nfonts; cur++)
+        FreeVec(ctx->fonts[cur]);
+    if (ctx->pix != NULL)
+        FreeVec(ctx->pix);
+    if (ctx->col != NULL)
+        FreeVec(ctx->col);
+    if (ctx->wild != NULL)
+        FreeVec(ctx->wild);
+    if (ctx->gat != NULL)
+        FreeVec(ctx->gat);
+    if (ctx->hist != NULL)
+        FreeVec(ctx->hist);
+    FreeVec(ctx);
+}
+
+/*
+ * gr_ctx_create() allocates buffers and loads the candidate fonts: the
+ *                 window font, the screen font and the system default.
+ *                 Caller holds the screen's layer info lock, so the
+ *                 window (and its font) remain valid.
+ */
+static gr_ctx_t *
+gr_ctx_create(struct Window *window, struct TextFont *scrfont)
+{
+    struct TextFont *tfonts[GR_MAX_FONTS];
+    gr_ctx_t        *ctx;
+    int              cur;
+
+    ctx = AllocVec(sizeof (*ctx), MEMF_ANY | MEMF_CLEAR);
+    if (ctx == NULL)
+        return (NULL);
+    ctx->pix  = AllocVec(GR_MAX_W * GR_MAX_H, MEMF_ANY);
+    ctx->col  = AllocVec(GR_MAX_W * sizeof (ULONG), MEMF_ANY);
+    ctx->wild = AllocVec(GR_MAX_W * sizeof (ULONG), MEMF_ANY);
+    ctx->gat  = AllocVec(GR_MAX_W * sizeof (WORD), MEMF_ANY);
+    ctx->hist = AllocVec(256 * sizeof (ULONG), MEMF_ANY);
+    if ((ctx->pix == NULL) || (ctx->col == NULL) || (ctx->wild == NULL) ||
+        (ctx->gat == NULL) || (ctx->hist == NULL)) {
+        gr_ctx_free(ctx);
+        return (NULL);
+    }
+    tfonts[0] = window->RPort->Font;
+    tfonts[1] = scrfont;
+    tfonts[2] = GfxBase->DefaultFont;
+    for (cur = 0; cur < GR_MAX_FONTS; cur++) {
+        int other;
+        if (tfonts[cur] == NULL)
+            continue;
+        for (other = 0; other < cur; other++)
+            if (tfonts[other] == tfonts[cur])
+                break;
+        if (other < cur)
+            continue;  // Duplicate
+        ctx->fonts[ctx->nfonts] = gr_font_load(tfonts[cur]);
+        if (ctx->fonts[ctx->nfonts] != NULL)
+            ctx->nfonts++;
+    }
+    if (ctx->nfonts == 0) {
+        gr_ctx_free(ctx);
+        return (NULL);
+    }
+    return (ctx);
+}
+
+/*
+ * gr_gadget_box() computes the box of a gadget in window coordinates.
+ *                 It returns FALSE if the box is not suitable. Caller
+ *                 holds LockIBase().
+ */
+static BOOL
+gr_gadget_box(struct Window *window, struct Gadget *gadget, gr_box_t *box)
+{
+    WORD left   = gadget->LeftEdge;
+    WORD top    = gadget->TopEdge;
+    WORD width  = gadget->Width;
+    WORD height = gadget->Height;
+
+    if (gadget->Flags & GFLG_RELRIGHT)
+        left += window->Width - 1;
+    if (gadget->Flags & GFLG_RELBOTTOM)
+        top += window->Height - 1;
+    if (gadget->Flags & GFLG_RELWIDTH)
+        width += window->Width;
+    if (gadget->Flags & GFLG_RELHEIGHT)
+        height += window->Height;
+    if ((window->Flags & WFLG_GIMMEZEROZERO) &&
+        ((gadget->Activation & (GACT_LEFTBORDER | GACT_RIGHTBORDER |
+                                GACT_TOPBORDER | GACT_BOTTOMBORDER)) == 0)) {
+        left -= window->BorderLeft;
+        top  -= window->BorderTop;
+    }
+    if ((width < 4) || (height < 4) || (width > GR_MAX_W) ||
+        (height > GR_MAX_H) || (left < 0) || (top < 0))
+        return (FALSE);
+    box->left     = left;
+    box->top      = top;
+    box->width    = width;
+    box->height   = height;
+    box->disabled = ((gadget->Flags & GFLG_DISABLED) != 0);
+    return (TRUE);
+}
+
+/* gr_read_box() reads the box pixels. Caller holds the layer info lock. */
+static void
+gr_read_box(gr_ctx_t *ctx, struct Window *window, gr_box_t *box)
+{
+    int x;
+    int y;
+    for (y = 0; y < box->height; y++) {
+        for (x = 0; x < box->width; x++) {
+            LONG pen = ReadPixel(window->RPort, box->left + x, box->top + y);
+            ctx->pix[y * box->width + x] = (pen < 0) ? 0 : (UBYTE) pen;
+        }
+    }
+}
+
+/* wk_recognized_label() returns the recognized label of a gadget */
+static const char *
+wk_recognized_label(glob_t *glob, struct Gadget *gadget)
+{
+    int cur;
+    for (cur = 0; cur < glob->wk_glabels; cur++)
+        if (glob->wk_glabel[cur].gadget == gadget)
+            return (glob->wk_glabel[cur].text);
+    return (NULL);
+}
+
+static void
+wk_add_option(glob_t *glob, wk_buf_t *wb, struct Window *window,
+              wk_opt_t *opt)
+{
+    struct Gadget *gadget = opt->gadget;
+    UBYTE         *str;
+
+    switch (opt->type) {
+        case WK_OPT_GADGET:
+            str = gadget_label(gadget);
+            if (str == NULL)
+                str = (UBYTE *) wk_recognized_label(glob, gadget);
+            wk_add(wb, "ID=%d ", gadget->GadgetID);
+            if (is_toggle_gadget(gadget)) {
+                BOOL sel = (gadget->Flags & GFLG_SELECTED) ? TRUE : FALSE;
+                if (gadget->Activation & GACT_TOGGLESELECT)
+                    wk_add(wb, "%s", sel ? "[x] " : "[ ] ");  // Checkbox
+                else
+                    wk_add(wb, "%s", sel ? "(*) " : "( ) ");  // MX item
+            }
+            if (str != NULL) {
+                wk_add(wb, "%.60s\r\n", str);
+            } else {
+                wk_add(wb, "(%d,%d) %dx%d\r\n",
+                       gadget->LeftEdge, gadget->TopEdge,
+                       gadget->Width, gadget->Height);
+            }
             break;
-        helper_windows = 0;
+        case WK_OPT_STRING: {
+            struct StringInfo *si = (struct StringInfo *) gadget->SpecialInfo;
+            int                pos;
+            str = gadget_label(gadget);
+            if (str != NULL) {
+                wk_add(wb, "ID=%d %.40s = ", gadget->GadgetID, str);
+            } else {
+                wk_add(wb, "ID=%d (%d,%d) %dx%d = ", gadget->GadgetID,
+                       gadget->LeftEdge, gadget->TopEdge,
+                       gadget->Width, gadget->Height);
+            }
+            if (gadget->Activation & GACT_LONGINT) {
+                wk_add(wb, "%ld", (long) si->LongInt);
+            } else {
+                /* Show printable ASCII only; the list is not converted */
+                wk_add(wb, "\"");
+                for (pos = 0; (pos < si->MaxChars) && (pos < 40) &&
+                              (si->Buffer[pos] != '\0'); pos++) {
+                    UBYTE ch = si->Buffer[pos];
+                    wk_add(wb, "%c", ((ch >= 0x20) && (ch < 0x7f)) ? ch : '?');
+                }
+                wk_add(wb, "%s\"", ((pos == 40) && (pos < si->MaxChars) &&
+                                     (si->Buffer[pos] != '\0')) ? "..." : "");
+            }
+            wk_add(wb, "%s\r\n",
+                   (gadget->Flags & GFLG_DISABLED) ? " (disabled)" : "");
+            break;
+        }
+        case WK_OPT_CLOSE:
+            wk_add(wb, "[Close window]\r\n");
+            break;
+        case WK_OPT_DEPTH:
+            if ((window->WLayer != NULL) && (window->WLayer->front == NULL))
+                wk_add(wb, "[Depth: send window to back]\r\n");
+            else
+                wk_add(wb, "[Depth: bring window to front]\r\n");
+            break;
+        case WK_OPT_ZOOM:
+            wk_add(wb, "[Zoom]\r\n");
+            break;
+        case WK_OPT_MENU:
+            wk_add(wb, "[Menu]\r\n");
+            break;
+    }
+}
+
+static void
+wk_add_item(wk_buf_t *wb, struct MenuItem *item)
+{
+    UBYTE *text = NULL;
+
+    if ((item->Flags & ITEMTEXT) && (item->ItemFill != NULL))
+        text = ((struct IntuiText *) item->ItemFill)->IText;
+    if (item->Flags & CHECKIT)
+        wk_add(wb, "%s", (item->Flags & CHECKED) ? "[x] " : "[ ] ");
+    wk_add(wb, "%.50s", (text != NULL) ? (char *) text : "(image)");
+    if (item->Flags & COMMSEQ)
+        wk_add(wb, "  (Amiga-%c)", item->Command);
+    if (item->SubItem != NULL)
+        wk_add(wb, " >");
+    if ((item->Flags & ITEMENABLED) == 0)
+        wk_add(wb, " (disabled)");
+    wk_add(wb, "\r\n");
+}
+
+/* wk_shown_clear() forgets the options shown */
+static void
+wk_shown_clear(glob_t *glob)
+{
+    int key;
+    for (key = 0; key < WK_MAX_OPTS; key++) {
+        glob->wk_shown[key].type = WK_OPT_NONE;
+        glob->wk_shown[key].ptr  = NULL;
+    }
+}
+
+/* wk_shown_set() records the option shown for a key */
+static void
+wk_shown_set(glob_t *glob, int key, UBYTE type, APTR ptr)
+{
+    struct Gadget *gadget = (struct Gadget *) ptr;
+    if ((key < 0) || (key >= WK_MAX_OPTS))
+        return;
+    glob->wk_shown[key].type = type;
+    glob->wk_shown[key].ptr  = ptr;
+    if ((type != WK_OPT_MENU) && (gadget != NULL)) {
+        glob->wk_shown[key].id         = gadget->GadgetID;
+        glob->wk_shown[key].gtype      = gadget->GadgetType;
+        glob->wk_shown[key].activation = gadget->Activation;
+        glob->wk_shown[key].text       = gadget->GadgetText;
+        glob->wk_shown[key].special    = gadget->SpecialInfo;
+    }
+}
+
+/*
+ * wk_shown_gadget() returns TRUE if the gadget shown for the key is still
+ *                   in the window, and is the same gadget (not another
+ *                   one which was allocated at the same address).
+ *                   Caller holds LockIBase().
+ */
+static BOOL
+wk_shown_gadget(glob_t *glob, struct Window *window, int key)
+{
+    struct Gadget *gadget = (struct Gadget *) glob->wk_shown[key].ptr;
+    struct Gadget *cur;
+
+    for (cur = window->FirstGadget; cur != NULL; cur = cur->NextGadget)
+        if (cur == gadget)
+            break;
+    return ((cur != NULL) &&
+            (gadget->GadgetID    == glob->wk_shown[key].id) &&
+            (gadget->GadgetType  == glob->wk_shown[key].gtype) &&
+            (gadget->Activation  == glob->wk_shown[key].activation) &&
+            ((APTR) gadget->GadgetText == glob->wk_shown[key].text) &&
+            (gadget->SpecialInfo == glob->wk_shown[key].special));
+}
+
+/* wk_show() lists the options of the current prompt level */
+static void
+wk_show(glob_t *glob, wk_buf_t *wb)
+{
+    struct Window   *window = glob->wk_window;
+    struct Menu     *menu;
+    struct MenuItem *item;
+    int              cur;
+
+    switch (glob->wk_level) {
+        case WK_GADGETS:
+            break;  // Shown by wk_show_gadget_page()
+        case WK_MENUS:
+            wk_add(wb, "Menus:\r\n");
+            wk_shown_clear(glob);
+            for (menu = window->MenuStrip, cur = 0;
+                 (menu != NULL) && (cur < WK_MAX_OPTS);
+                 menu = menu->NextMenu, cur++) {
+                wk_shown_set(glob, cur, WK_OPT_MENU, menu);
+                wk_add(wb, "    %c) %.50s%s\r\n", wk_keys[cur],
+                       (menu->MenuName != NULL) ? (char *) menu->MenuName : "",
+                       (menu->Flags & MENUENABLED) ? "" : " (disabled)");
+            }
+            wk_add(wb, "Select a menu (Backspace=back ESC=cancel).\r\n");
+            break;
+        case WK_ITEMS:
+        case WK_SUBITEMS: {
+            struct MenuItem *parent = NULL;
+            int              real;
+            menu = wk_nth_menu(window->MenuStrip, glob->wk_menu);
+            if (menu == NULL) {
+                wk_shown_clear(glob);
+                wk_add(wb, "Menu is no longer present.\r\n");
+                break;
+            }
+            item = menu->FirstItem;
+            if (glob->wk_level == WK_SUBITEMS) {
+                parent = wk_nth_item(item, glob->wk_item, &real);
+                if (parent == NULL) {
+                    wk_shown_clear(glob);
+                    wk_add(wb, "Menu item is no longer present.\r\n");
+                    break;
+                }
+                item = parent->SubItem;
+            }
+            wk_add(wb, "%.50s", (menu->MenuName != NULL) ?
+                                (char *) menu->MenuName : "");
+            if (parent != NULL) {
+                UBYTE *text = NULL;
+                if ((parent->Flags & ITEMTEXT) && (parent->ItemFill != NULL))
+                    text = ((struct IntuiText *) parent->ItemFill)->IText;
+                wk_add(wb, " > %.50s", (text != NULL) ? (char *) text : "");
+            }
+            wk_add(wb, ":\r\n");
+            wk_shown_clear(glob);
+            glob->wk_shown_menu   = menu;
+            glob->wk_shown_parent = parent;
+            for (cur = 0; (item != NULL) && (cur < WK_MAX_OPTS);
+                 item = item->NextItem) {
+                if (wk_item_listed(item) == FALSE)
+                    continue;
+                wk_shown_set(glob, cur, WK_OPT_MENU, item);
+                wk_add(wb, "    %c) ", wk_keys[cur++]);
+                wk_add_item(wb, item);
+            }
+            wk_add(wb, "Select an item (Space=next Backspace=back "
+                       "ESC=cancel).\r\n");
+            break;
+        }
+    }
+}
+
+/*
+ * wk_menu_pick_prepare() updates a menu item which is about to be picked,
+ *                        as Intuition would: the checkmark is toggled or
+ *                        set (clearing mutually excluded items), and the
+ *                        multi-select chain is terminated.
+ */
+static void
+wk_menu_pick_prepare(struct MenuItem *first, struct MenuItem *item, int real)
+{
+    if (item->Flags & CHECKIT) {
+        if (item->Flags & MENUTOGGLE)
+            item->Flags ^= CHECKED;
+        else
+            item->Flags |= CHECKED;
+        if ((item->Flags & CHECKED) && (item->MutualExclude != 0)) {
+            struct MenuItem *other;
+            int              pos = 0;
+            for (other = first; (other != NULL) && (pos < 32);
+                 other = other->NextItem, pos++) {
+                if ((pos != real) && (item->MutualExclude & (1UL << pos)))
+                    other->Flags &= ~CHECKED;
+            }
+        }
+    }
+    item->NextSelect = MENUNULL;
+}
+
+/* wk_buf_flush() emits buffered text, keeping the buffer for more */
+static void
+wk_buf_flush(glob_t *glob, wk_buf_t *wb)
+{
+    if (wb->len > 0)
+        xterm_console_emit(glob, (UBYTE *) wb->buf, wb->len);
+    wb->len = 0;
+}
+
+/*
+ * Gadget options are selected by the letters A-Z, where 'Z' is always
+ * [Menu] if the window has a menu. If a window has more gadget options
+ * than letters, they are shown in pages: Space shows the next page
+ * (cycling back to the first), and Backspace the previous page.
+ */
+typedef struct {
+    int  start;     // First gadget option shown
+    int  end;       // Last gadget option shown + 1
+    BOOL paged;     // Options are shown in pages
+    BOOL menu;      // Window has a menu
+    int  menu_key;  // Key index of [Menu], or -1
+    int  total;     // All options, including the menu
+} wk_page_t;
+
+/* wk_page_layout() computes the options of the page (holds LockIBase) */
+static void
+wk_page_layout(glob_t *glob, struct Window *window, wk_page_t *pg)
+{
+    int ngad;
+    int slots;
+
+    pg->total    = window_options(window, -1, NULL);
+    pg->menu     = (window->MenuStrip != NULL);
+    pg->menu_key = pg->menu ? WK_KEY_MENU : -1;
+    ngad         = pg->total - (pg->menu ? 1 : 0);
+    slots        = pg->menu ? WK_KEY_MENU : WK_GAD_KEYS;  // Letters for gadgets
+    pg->paged    = (ngad > slots);
+    if (pg->paged == FALSE)
+        glob->wk_page = 0;
+    pg->start = glob->wk_page * slots;
+    if (pg->start >= ngad) {  // Past the last page: back to the first
+        glob->wk_page = 0;
+        pg->start     = 0;
+    }
+    pg->end = pg->start + slots;
+    if (pg->end > ngad)
+        pg->end = ngad;
+}
+
+/* wk_add_label() caches a recognized gadget label */
+static void
+wk_add_label(glob_t *glob, struct Gadget *gadget, const char *text)
+{
+    int n = glob->wk_glabels;
+    if (n >= (int) (sizeof (glob->wk_glabel) / sizeof (glob->wk_glabel[0])))
+        return;
+    glob->wk_glabel[n].gadget = gadget;
+    strncpy(glob->wk_glabel[n].text, text, sizeof (glob->wk_glabel[n].text));
+    glob->wk_glabel[n].text[sizeof (glob->wk_glabel[n].text) - 1] = '\0';
+    glob->wk_glabels++;
+}
+
+/*
+ * wk_show_gadget_page() lists the gadget options of the current page.
+ *                       Labels drawn as pixels are recognized as they are
+ *                       listed, and each line is sent as soon as it is
+ *                       known. Must be called without holding LockIBase().
+ *                       While pixels are read, the screen's layer info is
+ *                       locked (before LockIBase(), as Intuition does) so
+ *                       that the window can not close.
+ */
+static void
+wk_show_gadget_page(glob_t *glob)
+{
+    struct Screen   *screen;
+    struct Window   *window  = glob->wk_window;
+    struct TextFont *scrfont = NULL;
+    gr_ctx_t        *ctx     = NULL;
+    BOOL             gr_ok   = (GfxBase != NULL) && (LayersBase != NULL);
+    wk_page_t        pg;
+    wk_buf_t         wb;
+    ULONG            ilock;
+    int              key = 0;
+    int              cur;
+
+    if (wk_buf_init(&wb) == FALSE)
+        return;
+    ilock = LockIBase(0);
+    if (wk_window_open(window) == FALSE) {
+        UnlockIBase(ilock);
+        wk_add(&wb, "Window has closed.\r\n");
+        wk_buf_emit(glob, &wb);
+        wk_reset(glob);
+        return;
+    }
+    screen = window->WScreen;
+    wk_page_layout(glob, window, &pg);
+    wk_shown_clear(glob);
+    wk_add(&wb, "Program has \"%.60s\" window open.\r\n",
+           (window->Title != NULL) ? (char *) window->Title : "");
+    if ((glob->wk_pass == 1) && (glob->wk_helpers > 1)) {
+        wk_add(&wb, "Warning: %d windows are open; this one may belong "
+               "to another program.\r\n", glob->wk_helpers);
     }
     UnlockIBase(ilock);
-    if (firstgadget == NULL) {
-        glob->requester_abort_active = FALSE;
+    wk_buf_flush(glob, &wb);
+
+    if (gr_ok)
+        scrfont = OpenFont(screen->Font);  // Not locked: may load from disk
+
+    for (cur = pg.start; cur < pg.end; cur++, key++) {
+        wk_opt_t opt;
+        gr_box_t box  = { 0, 0, 0, 0, FALSE };
+        BOOL     need = FALSE;
+        BOOL     open;
+        UWORD    id   = 0;
+        const char *mark = "";
+
+        if (gr_ok)
+            LockLayerInfo(&screen->LayerInfo);
+        ilock = LockIBase(0);
+        open  = wk_window_open(window) &&
+                (cur < window_options(window, cur, &opt));
+        if (open) {
+            wk_shown_set(glob, key, opt.type, opt.gadget);
+            wk_add(&wb, "    %c) ", wk_keys[key]);
+            if (gr_ok && (opt.type == WK_OPT_GADGET) &&
+                (gadget_label(opt.gadget) == NULL) &&
+                (wk_recognized_label(glob, opt.gadget) == NULL) &&
+                gr_gadget_box(window, opt.gadget, &box)) {
+                need = TRUE;
+                id   = opt.gadget->GadgetID;
+                mark = "";
+                if (is_toggle_gadget(opt.gadget)) {
+                    BOOL sel = (opt.gadget->Flags & GFLG_SELECTED) != 0;
+                    if (opt.gadget->Activation & GACT_TOGGLESELECT)
+                        mark = sel ? "[x] " : "[ ] ";
+                    else
+                        mark = sel ? "(*) " : "( ) ";
+                }
+            } else {
+                wk_add_option(glob, &wb, window, &opt);
+            }
+        }
+        UnlockIBase(ilock);
+        if (need) {
+            /* Window can not close while the layer info is locked */
+            if (ctx == NULL)
+                ctx = gr_ctx_create(window, scrfont);
+            if (ctx != NULL)
+                gr_read_box(ctx, window, &box);
+        }
+        if (gr_ok)
+            UnlockLayerInfo(&screen->LayerInfo);
+        if (open == FALSE) {
+            wk_add(&wb, "Cancel (Window closed).\r\n");
+            wk_buf_emit(glob, &wb);
+            wk_reset(glob);
+            gr_ctx_free(ctx);
+            if (scrfont != NULL)
+                CloseFont(scrfont);
+            return;
+        }
+        if (need) {
+            char text[24];
+            if ((ctx != NULL) &&
+                gr_recognize(ctx, box.width, box.height, box.disabled,
+                             text, sizeof (text))) {
+                wk_add_label(glob, opt.gadget, text);
+                wk_add(&wb, "ID=%d %s%s\r\n", id, mark, text);
+            } else {
+                wk_add(&wb, "ID=%d %s(%d,%d) %dx%d\r\n", id, mark, box.left,
+                       box.top, box.width, box.height);
+            }
+        }
+        wk_buf_flush(glob, &wb);  // Show each option as it is known
+    }
+    gr_ctx_free(ctx);
+    if (scrfont != NULL)
+        CloseFont(scrfont);
+
+    if (pg.menu_key >= 0) {
+        wk_shown_set(glob, pg.menu_key, WK_OPT_MENU, NULL);
+        wk_add(&wb, "    %c) [Menu]\r\n", wk_keys[pg.menu_key]);
+    }
+    wk_add(&wb, "Select an item (%s%sESC=cancel).\r\n",
+           pg.paged ? "Space=next " : "",
+           (glob->wk_page > 0) ? "Backspace=back " : "");
+    wk_buf_emit(glob, &wb);
+}
+
+/*
+ * wk_skip_esc_seq() discards the rest of an escape sequence (such as
+ *                   that of a cursor key) which follows an ESC, if it has
+ *                   already arrived. It returns TRUE if one was discarded,
+ *                   meaning the ESC was not a lone ESC key press.
+ */
+static BOOL
+wk_skip_esc_seq(glob_t *glob)
+{
+    ULONG pos = glob->unproc_spos;
+    UBYTE ch;
+
+    if (pos == glob->unproc_epos)
+        return (FALSE);
+    ch = glob->unproc_buf[pos];
+    if ((ch != '[') && (ch != 'O'))
+        return (FALSE);
+    do {
+        if (++pos == sizeof (glob->unproc_buf))
+            pos = 0;
+        if (pos == glob->unproc_epos)
+            return (FALSE);  // Incomplete
+        ch = glob->unproc_buf[pos];
+    } while ((ch < 0x40) || (ch > 0x7e));
+    if (++pos == sizeof (glob->unproc_buf))
+        pos = 0;
+    glob->unproc_spos = pos;
+    return (TRUE);
+}
+
+/* wk_cancel() ends the prompt */
+static void
+wk_cancel(glob_t *glob)
+{
+    if (glob->wk_level == WK_TEXT)
+        xterm_console_emit(glob, (UBYTE *) "\r\nCanceled.\r\n", 13);
+    else
+        xterm_console_emit(glob, (UBYTE *) "Canceled.\r\n", 11);
+    wk_reset(glob);
+}
+
+/*
+ * wk_esc_key() handles ESC in the prompt. A lone ESC key press cancels
+ *              the prompt, but a cursor or function key (an escape
+ *              sequence) is ignored. If nothing follows the ESC yet, the
+ *              decision waits for more input or the ESC timer
+ *              (wk_esc_timeout()).
+ */
+static void
+wk_esc_key(glob_t *glob)
+{
+    if (wk_skip_esc_seq(glob)) {
+        xterm_console_emit(glob, (UBYTE *) "\a", 1);
+    } else if (glob->unproc_spos != glob->unproc_epos) {
+        wk_cancel(glob);  // Something other than a sequence follows
+    } else {
+        glob->wk_esc = WK_ESC_WAIT;
+        xterm_esc_timer_start(glob);
+    }
+}
+
+/* wk_esc_timeout() is called when the ESC timer expires */
+static BOOL
+wk_esc_timeout(glob_t *glob)
+{
+    if (glob->wk_esc != WK_ESC_WAIT)
+        return (FALSE);
+    glob->wk_esc = WK_ESC_NONE;  // Timer already completed
+    wk_cancel(glob);
+    return (TRUE);
+}
+
+/*
+ * wk_esc_follow() handles the input after an ESC in the prompt. It returns
+ *                 TRUE if the input was consumed.
+ */
+static BOOL
+wk_esc_follow(glob_t *glob, UBYTE cmd)
+{
+    if (glob->wk_esc == WK_ESC_SEQ) {
+        if ((cmd >= 0x40) && (cmd <= 0x7e))
+            glob->wk_esc = WK_ESC_NONE;  // Final byte of the sequence
+        return (TRUE);
+    }
+    xterm_timer_cancel(glob);
+    glob->wk_esc = WK_ESC_NONE;
+    if ((cmd == '[') || (cmd == 'O')) {
+        glob->wk_esc = WK_ESC_SEQ;
+        xterm_console_emit(glob, (UBYTE *) "\a", 1);
+        return (TRUE);
+    }
+    wk_cancel(glob);  // The ESC was a lone key press
+    return (FALSE);   // This input is not part of the prompt
+}
+
+/* wk_gadget_present() is TRUE if the gadget is in the window (LockIBase) */
+static BOOL
+wk_gadget_present(struct Window *window, struct Gadget *gadget)
+{
+    struct Gadget *cur;
+    for (cur = window->FirstGadget; cur != NULL; cur = cur->NextGadget)
+        if (cur == gadget)
+            return (TRUE);
+    return (FALSE);
+}
+
+/*
+ * wk_modify_begin() prepares to change a gadget of the window: it locks the
+ *                   screen's layers (so the window can not close) and
+ *                   verifies the gadget is still present. It returns the
+ *                   locked screen, or NULL (with *problem set). The
+ *                   caller must call wk_modify_end() with the screen.
+ */
+static struct Screen *
+wk_modify_begin(struct Window *window, struct Gadget *gadget,
+                const char **problem)
+{
+    struct Screen *screen = NULL;
+    ULONG          ilock;
+    BOOL           ok;
+
+    *problem = "The gadget is no longer present.";
+    ilock = LockIBase(0);
+    if (wk_window_open(window) && wk_gadget_present(window, gadget))
+        screen = window->WScreen;
+    UnlockIBase(ilock);
+    if (screen == NULL)
+        return (NULL);
+
+    LockLayerInfo(&screen->LayerInfo);  // Before LockIBase(), as Intuition
+    ilock = LockIBase(0);
+    ok = wk_window_open(window) && wk_gadget_present(window, gadget);
+    UnlockIBase(ilock);
+    if (ok == FALSE) {
+        UnlockLayerInfo(&screen->LayerInfo);
+        return (NULL);
+    }
+    *problem = NULL;
+    return (screen);
+}
+
+static void
+wk_modify_end(struct Screen *screen)
+{
+    UnlockLayerInfo(&screen->LayerInfo);
+}
+
+static void
+wk_report_problem(glob_t *glob, const char *problem)
+{
+    xterm_console_emit(glob, (UBYTE *) problem, strlen(problem));
+    xterm_console_emit(glob, (UBYTE *) "\r\n", 2);
+}
+
+/*
+ * wk_toggle_gadget() changes the selected state of a toggle gadget (such
+ *                    as a checkbox) or selects a gadget which only reports
+ *                    being pressed (such as a GadTools MX item), as a
+ *                    mouse click would. It returns FALSE if the state
+ *                    could not be changed, after reporting why.
+ */
+static BOOL
+wk_toggle_gadget(glob_t *glob, struct Window *window, struct Gadget *gadget)
+{
+    const char    *problem;
+    struct Screen *screen = wk_modify_begin(window, gadget, &problem);
+    BOOL           sel;
+
+    if (screen == NULL) {
+        wk_report_problem(glob, problem);
         return (FALSE);
     }
-
-    if (glob->requester_abort_active == FALSE) {
-        char buf[160];
-        xterm_console_emit(glob, buf,
-                sprintf(buf, "Application has \"%.60s\" window open.\r\n",
-                        window->Title ?: (UBYTE *)""));
-        if ((pass == 1) && (helper_windows > 1)) {
-            xterm_console_emit(glob, buf,
-                    sprintf(buf, "Warning: %d such windows are open; this one "
-                            "may belong to another program.\r\n",
-                            helper_windows));
-        }
+    if (gadget->Flags & GFLG_DISABLED) {
+        wk_modify_end(screen);
+        wk_report_problem(glob, "The gadget is disabled.");
+        return (FALSE);
     }
-    gadget_count = 0;
-    for (gadget = firstgadget; gadget != NULL; gadget = gadget->NextGadget) {
-        ULONG gtype = gadget->GadgetType;
-        if (((gtype & GTYP_GADGETTYPE) == 0) &&
-            (((gtype & GTYP_GTYPEMASK) == GTYP_CUSTOMGADGET) ||
-             ((gtype & GTYP_GTYPEMASK) == GTYP_BOOLGADGET))) {
-            UBYTE  buf[96];  // Max 84: 16 + 65 + CR LF NUL
+    if (gadget->Activation & GACT_TOGGLESELECT)
+        sel = (gadget->Flags & GFLG_SELECTED) ? FALSE : TRUE;  // Toggle
+    else
+        sel = TRUE;  // MX item: the program deselects the others
 
-            if (glob->requester_abort_active == FALSE) {
-                UBYTE *str;
-                UBYTE buf2[80];
-show_selected:
-                str = gadget_label(gadget);
-
-                if (str == NULL) {
-                    str = buf2;
-                    sprintf(str, "(%d,%d) %dx%d", gadget->LeftEdge,
-                            gadget->TopEdge, gadget->Width, gadget->Height);
-                }
-                xterm_console_emit(glob, buf,
-                    sprintf(buf, "    %c) ID=%d %.65s\r\n", 'A' + gadget_count,
-                            gadget->GadgetID, str));
-            } else if (gadget_count == gadget_want) {
-                gadget_wanted = gadget;
-                xterm_console_emit(glob, "Selected:", 9);
-                goto show_selected;
-            }
-            gadget_count++;
-        } else {
-            struct IntuiText *it = gadget->GadgetText;
-            UBYTE  buf[96];  // Max 84: 16 + 65 + CR LF NUL
-            UBYTE *str;
-            if ((gadget->Flags & GFLG_LABELMASK) == GFLG_LABELSTRING)
-                str = (UBYTE *) gadget->GadgetText;
-            else if (((gadget->Flags & GFLG_LABELMASK) == GFLG_LABELITEXT) &&
-                     (it != NULL) && (it->IText != NULL))
-                str = it->IText;
+    if ((gadget->GadgetType & GTYP_GTYPEMASK) == GTYP_CUSTOMGADGET) {
+        /* BOOPSI gadget: it manages (and renders) its own state */
+        (void) SetGadgetAttrs(gadget, window, NULL, GA_Selected, sel,
+                              TAG_END);
+    } else {
+        UWORD pos = RemoveGList(window, gadget, 1);
+        if (pos != (UWORD) ~0) {
+            if (sel)
+                gadget->Flags |= GFLG_SELECTED;
             else
-                str = (UBYTE *) "";
-            sprintf(buf, "    ?) ID=%d %.65s\r\n", gadget->GadgetID, str);
+                gadget->Flags &= ~GFLG_SELECTED;
+            (void) AddGList(window, gadget, pos, 1, NULL);
+            RefreshGList(gadget, window, NULL, 1);
         }
     }
+    wk_modify_end(screen);
+    return (TRUE);
+}
+
+/*
+ * wk_text_begin() starts text entry for a string gadget, with the current
+ *                 contents as the initial text. Caller holds LockIBase().
+ */
+static BOOL
+wk_text_begin(glob_t *glob, wk_buf_t *wb, struct Gadget *gadget)
+{
+    struct StringInfo *si = (struct StringInfo *) gadget->SpecialInfo;
+    int                max;
+    int                len;
+
+    if (gadget->Flags & GFLG_DISABLED) {
+        wk_add(wb, "The gadget is disabled.\r\n");
+        return (FALSE);
+    }
+    max = si->MaxChars - 1;  // MaxChars includes the NUL
+    if (max > (int) sizeof (glob->wk_text) - 1)
+        max = sizeof (glob->wk_text) - 1;
+    if (max < 1) {
+        wk_add(wb, "The gadget does not accept text.\r\n");
+        return (FALSE);
+    }
+    for (len = 0; (len < max) && (si->Buffer[len] != '\0'); len++)
+        glob->wk_text[len] = si->Buffer[len];
+    glob->wk_sgad  = gadget;
+    glob->wk_tlen  = len;
+    glob->wk_tmax  = max;
+    glob->wk_tint  = (gadget->Activation & GACT_LONGINT) ? TRUE : FALSE;
+    glob->wk_level = WK_TEXT;
+    wk_add(wb, "Enter new %s (up to %d characters). Return sets it, "
+           "^U clears, ESC cancels.\r\n> ",
+           glob->wk_tint ? "number" : "text", max);
+    return (TRUE);
+}
+
+/* wk_parse_long() converts a decimal number; it returns FALSE if invalid */
+static BOOL
+wk_parse_long(const char *str, int len, LONG *valuep)
+{
+    ULONG value = 0;
+    BOOL  neg   = FALSE;
+    int   pos   = 0;
+
+    if ((len > 0) && ((str[0] == '-') || (str[0] == '+'))) {
+        neg = (str[0] == '-');
+        pos++;
+    }
+    if (pos >= len)
+        return (FALSE);
+    for (; pos < len; pos++) {
+        if ((str[pos] < '0') || (str[pos] > '9'))
+            return (FALSE);
+        value = value * 10 + (str[pos] - '0');
+        if (value > 0x80000000UL)
+            return (FALSE);
+    }
+    if ((value == 0x80000000UL) && (neg == FALSE))
+        return (FALSE);
+    *valuep = neg ? (LONG) (0 - value) : (LONG) value;
+    return (TRUE);
+}
+
+/* wk_format_long() writes a decimal number, returning its length */
+static int
+wk_format_long(char *str, LONG value)
+{
+    char  digits[12];
+    ULONG uval = (value < 0) ? (ULONG) 0 - (ULONG) value : (ULONG) value;
+    int   count = 0;
+    int   len   = 0;
+
+    do {
+        digits[count++] = '0' + (uval % 10);
+        uval /= 10;
+    } while (uval != 0);
+    if (value < 0)
+        str[len++] = '-';
+    while (count > 0)
+        str[len++] = digits[--count];
+    return (len);
+}
+
+/*
+ * wk_text_commit() replaces the contents of the string gadget with the
+ *                  entered text, refreshes the gadget, and notifies the
+ *                  application as Intuition would when Return is pressed
+ *                  in the gadget.
+ */
+static void
+wk_text_commit(glob_t *glob)
+{
+    struct Window     *window = glob->wk_window;
+    struct Gadget     *gadget = glob->wk_sgad;
+    struct Screen     *screen = NULL;
+    struct StringInfo *si;
+    const char        *problem = NULL;
+    char              *text    = glob->wk_text;  // Not on the small stack
+    LONG               value   = 0;
+    BOOL               notify  = FALSE;
+    int                len     = glob->wk_tlen;
+
+    if (glob->wk_tint) {
+        if (wk_parse_long(text, len, &value) == FALSE) {
+            xterm_console_emit(glob, (UBYTE *) "\a", 1);
+            return;  // Stay in text entry
+        }
+        len = wk_format_long(text, value);  // Normalized ("+07" -> "7")
+    }
+    text[len] = '\0';
+
+    screen = wk_modify_begin(window, gadget, &problem);
+    if (screen != NULL) {
+        /* The window can not close while its screen's layers are locked */
+        si = (struct StringInfo *) gadget->SpecialInfo;
+        if (gadget->Flags & GFLG_SELECTED)
+            problem = "The gadget is being edited at the Amiga.";
+        else if (gadget->Flags & GFLG_DISABLED)
+            problem = "The gadget is disabled.";
+        else if (len >= si->MaxChars)
+            problem = "The text is too long for the gadget.";
+        else
+            problem = wk_input_problem(window);  // Not locked: checked again
+        if (problem == NULL) {
+            UWORD pos = RemoveGList(window, gadget, 1);
+            if (pos == (UWORD) ~0) {
+                problem = "The gadget is no longer present.";
+            } else {
+                if (si->UndoBuffer != NULL)
+                    memcpy(si->UndoBuffer, si->Buffer, si->MaxChars);
+                memcpy(si->Buffer, text, len + 1);
+                si->NumChars  = len;
+                si->BufferPos = len;
+                si->DispPos   = 0;
+                if (glob->wk_tint)
+                    si->LongInt = value;
+                (void) AddGList(window, gadget, pos, 1, NULL);
+                RefreshGList(gadget, window, NULL, 1);
+                notify = (gadget->Activation & GACT_RELVERIFY) &&
+                         (window->IDCMPFlags & IDCMP_GADGETUP);
+            }
+        }
+        wk_modify_end(screen);
+    }
+
+    if (problem != NULL) {
+        xterm_console_emit(glob, (UBYTE *) "\r\n", 2);
+        xterm_console_emit(glob, (UBYTE *) problem, strlen(problem));
+        xterm_console_emit(glob, (UBYTE *) "\r\n", 2);
+    } else {
+        xterm_console_emit(glob, (UBYTE *) "\r\nSet.\r\n", 8);
+    }
+    wk_reset(glob);
+    if (notify)
+        (void) task_window_send(glob, window, IDCMP_GADGETUP, 0, gadget);
+}
+
+/* wk_text_key() handles a key while entering text for a string gadget */
+static void
+wk_text_key(glob_t *glob, UBYTE cmd)
+{
+    static const UBYTE rubout[] = "\b \b";
+
+    switch (cmd) {
+        case 0x1b:  // ESC (cursor and function keys are not supported)
+            wk_esc_key(glob);
+            return;
+        case 0x03:  // ^C
+            wk_cancel(glob);
+            return;
+        case '\r':
+        case '\n':
+            glob->wk_eat_nl = (cmd == '\r');  // Telnet sends CR LF or CR NUL
+            wk_text_commit(glob);
+            return;
+        case 0x08:  // Backspace
+        case 0x7f:  // Delete
+            if (glob->wk_tlen == 0) {
+                xterm_console_emit(glob, (UBYTE *) "\a", 1);
+            } else {
+                glob->wk_tlen--;
+                xterm_console_emit(glob, rubout, 3);
+            }
+            return;
+        case 0x15:  // ^U: clear
+        case 0x18:  // ^X: clear
+            while (glob->wk_tlen > 0) {
+                glob->wk_tlen--;
+                xterm_console_emit(glob, rubout, 3);
+            }
+            return;
+    }
+    if ((cmd < 0x20) || ((cmd >= 0x7f) && (cmd < 0xa0)) ||
+        (glob->wk_tlen >= glob->wk_tmax) ||
+        (glob->wk_tint && ((cmd < '0') || (cmd > '9')) &&
+         (((cmd != '-') && (cmd != '+')) || (glob->wk_tlen != 0)))) {
+        xterm_console_emit(glob, (UBYTE *) "\a", 1);
+        return;
+    }
+    glob->wk_text[glob->wk_tlen++] = cmd;
+    xterm_console_emit_text(glob, &cmd, 1);
+}
+
+/*
+ * task_window_kill() prompts the user to activate (by selection) a gadget
+ *                    or menu item of a window opened by the child
+ *                    application. This is mostly useful to terminate
+ *                    requesters which have popped up so the program can
+ *                    continue. It returns TRUE if the key was consumed.
+ */
+static BOOL
+task_window_kill(glob_t *glob, UBYTE cmd)
+{
+    struct Task   *task       = (struct Task *) get_recent_process(glob);
+    struct Window *window;
+    wk_buf_t       wb;
+    ULONG          ilock;
+    ULONG          send_class = 0;  // IDCMP message to send after unlocking
+    UWORD          send_code  = 0;
+    APTR           send_addr  = NULL;
+    int            action     = WK_ACT_NONE;
+    int            idx        = -1;
+    BOOL           done       = FALSE;  // Prompt ends
+    BOOL           suspend    = FALSE;
+    BOOL           bell       = FALSE;
+    BOOL           show_page  = FALSE;  // Show gadget options after unlock
+    BOOL           show_text  = FALSE;  // Show text to edit after emit
+    BOOL           toggle     = FALSE;  // Change gadget's selected state
+
     if (glob->requester_abort_active == FALSE) {
-        xterm_console_emit(glob,
-                           "Select a letter to activate the gadget.\r\n", 41);
+        /* The requester abort key was pressed */
+        int pass;
+        int count;
+        if (is_valid_task(task) == FALSE)
+            return (FALSE);
+        ilock = LockIBase(0);
+        window = wk_find_window(glob, task, &pass, &count);
+        UnlockIBase(ilock);
+        if (window == NULL)
+            return (FALSE);  // Not consumed: key goes to the application
+        glob->wk_window   = window;
+        glob->wk_pass     = pass;
+        glob->wk_helpers  = count;
+        glob->wk_level    = WK_GADGETS;
+        glob->wk_page     = 0;
+        glob->wk_glabels  = 0;
         glob->requester_abort_active = TRUE;
+        wk_show_gadget_page(glob);
         return (TRUE);
     }
 
-    /* User has made a selection */
-    if (gadget_wanted != NULL) {
-        /*
-         * Suspend at the "Software Failure" requester of the session's own
-         * application leaves that process (normally the shell, as CLI
-         * commands run in the shell process) frozen forever.  Replace it.
-         */
-        BOOL suspend = (pass == 0) && (window->Title != NULL) &&
-                       (strcmp((char *) window->Title,
-                               "Software Failure") == 0) &&
-                       label_matches(gadget_label(gadget_wanted), "suspend");
-        task_window_button_press(window, gadget_wanted);
-        if (suspend)
-            replace_suspended_shell(glob, (struct Process *) task);
+    if (glob->wk_esc != WK_ESC_NONE) {
+        /* FALSE: prompt was canceled, so the input goes to the application */
+        return (wk_esc_follow(glob, cmd));
     }
-    glob->requester_abort_active = FALSE;
+    if (glob->wk_level == WK_TEXT) {
+        wk_text_key(glob, cmd);
+        return (TRUE);
+    }
+    if (cmd == 0x1b) {  // ESC: cancel, unless a cursor or function key
+        wk_esc_key(glob);
+        return (TRUE);
+    }
+    if (wk_buf_init(&wb) == FALSE) {
+        wk_reset(glob);
+        return (TRUE);
+    }
+    if ((cmd >= 'a') && (cmd <= 'z'))
+        cmd = cmd - 'a' + 'A';
+    if (cmd != '\0') {
+        const char *ptr = strchr(wk_keys, cmd);
+        if (ptr != NULL)
+            idx = ptr - wk_keys;
+    }
+
+    ilock = LockIBase(0);
+    window = glob->wk_window;
+    if (wk_window_open(window) == FALSE) {
+        wk_add(&wb, "The window has closed.\r\n");
+        window = NULL;
+        done   = TRUE;
+        goto unlock;
+    }
+    if ((cmd == 0x08) || (cmd == 0x7f)) {  // Backspace: previous level
+        if (glob->wk_level == WK_GADGETS) {
+            if (glob->wk_page > 0) {
+                glob->wk_page--;  // Previous page of options
+                show_page = TRUE;
+            } else {
+                bell = TRUE;
+            }
+        } else if (glob->wk_level == WK_MENUS) {
+            glob->wk_level = WK_GADGETS;
+            show_page      = TRUE;
+        } else {
+            glob->wk_level--;
+            wk_show(glob, &wb);
+        }
+        goto unlock;
+    }
+    if ((cmd == ' ') && (glob->wk_level == WK_GADGETS)) {
+        wk_page_t pg;
+        wk_page_layout(glob, window, &pg);
+        if (pg.paged) {
+            glob->wk_page++;  // Next page of options (wraps to first)
+            show_page = TRUE;
+        } else {
+            bell = TRUE;
+        }
+        goto unlock;
+    }
+    if (idx < 0) {
+        bell = TRUE;
+        goto unlock;
+    }
+
+    switch (glob->wk_level) {
+        case WK_GADGETS: {
+            /* The option is the one shown for the key, never another */
+            wk_opt_t opt;
+            if ((idx >= WK_MAX_OPTS) ||
+                (glob->wk_shown[idx].type == WK_OPT_NONE)) {
+                bell = TRUE;
+                break;
+            }
+            opt.type   = glob->wk_shown[idx].type;
+            opt.gadget = (struct Gadget *) glob->wk_shown[idx].ptr;
+            if (opt.type == WK_OPT_MENU) {
+                if (window->MenuStrip == NULL) {
+                    wk_add(&wb, "The menu is no longer present.\r\n");
+                    done = TRUE;
+                    break;
+                }
+                glob->wk_level = WK_MENUS;
+                wk_show(glob, &wb);
+                break;
+            }
+            if (wk_shown_gadget(glob, window, idx) == FALSE) {
+                wk_add(&wb, "Selected:    %c) The gadget is no longer "
+                       "present. Nothing was done.\r\n", wk_keys[idx]);
+                done = TRUE;
+                break;
+            }
+            wk_add(&wb, "Selected:    %c) ", wk_keys[idx]);
+            wk_add_option(glob, &wb, window, &opt);
+            done = TRUE;
+            switch (opt.type) {
+                case WK_OPT_GADGET:
+                    /*
+                     * Suspend at the "Software Failure" requester of the
+                     * session's own application leaves that process
+                     * (normally the shell, as CLI commands run in the shell
+                     * process) frozen forever. Replace it.
+                     */
+                    suspend = (glob->wk_pass == 0) &&
+                              (window->Title != NULL) &&
+                              (strcmp((char *) window->Title,
+                                      "Software Failure") == 0) &&
+                              label_matches(gadget_label(opt.gadget),
+                                            "suspend");
+                    /* A gadget may report only being pressed (such as MX) */
+                    if (((opt.gadget->Activation & GACT_RELVERIFY) == 0) &&
+                        (opt.gadget->Activation & GACT_IMMEDIATE))
+                        send_class = IDCMP_GADGETDOWN;
+                    else
+                        send_class = IDCMP_GADGETUP;
+                    send_addr  = opt.gadget;
+                    toggle     = is_toggle_gadget(opt.gadget);
+                    break;
+                case WK_OPT_STRING:
+                    if (wk_input_problem(window) != NULL) {
+                        wk_add(&wb, "%s Nothing was done.\r\n",
+                               wk_input_problem(window));
+                        break;
+                    }
+                    if (wk_text_begin(glob, &wb, opt.gadget)) {
+                        done      = FALSE;
+                        show_text = TRUE;
+                    }
+                    break;
+                case WK_OPT_CLOSE:
+                    send_class = IDCMP_CLOSEWINDOW;
+                    break;
+                case WK_OPT_DEPTH:
+                    if ((window->WLayer != NULL) &&
+                        (window->WLayer->front == NULL))
+                        action = WK_ACT_BACK;
+                    else
+                        action = WK_ACT_FRONT;
+                    break;
+                case WK_OPT_ZOOM:
+                    action = WK_ACT_ZOOM;
+                    break;
+            }
+            break;
+        }
+        case WK_MENUS: {
+            struct Menu *menu = wk_nth_menu(window->MenuStrip, idx);
+            if ((idx >= WK_MAX_OPTS) ||
+                (glob->wk_shown[idx].type == WK_OPT_NONE)) {
+                bell = TRUE;
+                break;
+            }
+            if (menu != glob->wk_shown[idx].ptr) {
+                wk_add(&wb, "The menus have changed.\r\n");
+                wk_show(glob, &wb);  // Show them as they are now
+                break;
+            }
+            if ((menu->Flags & MENUENABLED) == 0) {
+                bell = TRUE;
+                break;
+            }
+            glob->wk_menu  = idx;
+            glob->wk_level = WK_ITEMS;
+            wk_show(glob, &wb);
+            break;
+        }
+        case WK_ITEMS:
+        case WK_SUBITEMS: {
+            struct Menu     *menu = wk_nth_menu(window->MenuStrip,
+                                                glob->wk_menu);
+            struct MenuItem *first;
+            struct MenuItem *item;
+            struct MenuItem *parent    = NULL;
+            int              item_real = 0;
+            int              real;
+            if ((idx >= WK_MAX_OPTS) ||
+                (glob->wk_shown[idx].type == WK_OPT_NONE)) {
+                bell = TRUE;
+                break;
+            }
+            if (glob->wk_level == WK_SUBITEMS)
+                parent = (menu == NULL) ? NULL :
+                         wk_nth_item(menu->FirstItem, glob->wk_item,
+                                     &item_real);
+            first = (parent != NULL) ? parent->SubItem :
+                    (menu != NULL) ? menu->FirstItem : NULL;
+            item = wk_nth_item(first, idx, &real);
+            if ((menu == NULL) || (menu != glob->wk_shown_menu) ||
+                (parent != glob->wk_shown_parent) ||
+                (item == NULL) || (item != glob->wk_shown[idx].ptr)) {
+                wk_add(&wb, "The menu has changed. Nothing was done.\r\n");
+                done = TRUE;
+                break;
+            }
+            if ((item->Flags & ITEMENABLED) == 0) {
+                bell = TRUE;
+                break;
+            }
+            if ((parent == NULL) && (item->SubItem != NULL)) {
+                glob->wk_item  = idx;
+                glob->wk_level = WK_SUBITEMS;
+                wk_show(glob, &wb);
+                break;
+            }
+            done = TRUE;
+            if ((window->IDCMPFlags & IDCMP_MENUPICK) == 0) {
+                wk_add(&wb, "The program does not accept menu "
+                       "selections.\r\n");
+                break;
+            }
+            wk_menu_pick_prepare(first, item, real);
+            wk_add(&wb, "Selected:    %c) ", wk_keys[idx]);
+            wk_add_item(&wb, item);
+            send_class = IDCMP_MENUPICK;
+            if (parent == NULL)
+                send_code = FULLMENUNUM(glob->wk_menu, real, NOSUB);
+            else
+                send_code = FULLMENUNUM(glob->wk_menu, item_real, real);
+            break;
+        }
+    }
+
+    if ((send_class != 0) || toggle) {
+        /* Refuse input which the program could not receive from the user */
+        const char *problem = wk_input_problem(window);
+        if ((problem == NULL) && (send_class != 0) &&
+            ((window->IDCMPFlags & send_class) == 0)) {
+            if (toggle)
+                send_class = 0;  // Change the state only; program reads it
+            else
+                problem = "The program does not accept this input.";
+        }
+        if (problem != NULL) {
+            wk_add(&wb, "%s Nothing was done.\r\n", problem);
+            send_class = 0;
+            toggle     = FALSE;
+            suspend    = FALSE;
+        }
+    }
+
+unlock:
+    UnlockIBase(ilock);
+    if (bell)
+        wk_add(&wb, "\a");
+    wk_buf_emit(glob, &wb);
+    if (show_text)
+        xterm_console_emit_text(glob, (UBYTE *) glob->wk_text, glob->wk_tlen);
+    if (done)
+        wk_reset(glob);
+    else if (show_page)
+        wk_show_gadget_page(glob);
+
+    if (window != NULL) {
+        if (toggle && (wk_toggle_gadget(glob, window, send_addr) == FALSE))
+            send_class = 0;  // State could not be changed
+        if ((send_class != 0) &&
+            (task_window_send(glob, window, send_class, send_code,
+                              send_addr) == FALSE))
+            suspend = FALSE;  // Software Failure requester was not answered
+        switch (action) {
+            case WK_ACT_FRONT:
+                WindowToFront(window);
+                break;
+            case WK_ACT_BACK:
+                WindowToBack(window);
+                break;
+            case WK_ACT_ZOOM:
+                ZipWindow(window);
+                break;
+        }
+    }
+    if (suspend)
+        replace_suspended_shell(glob, (struct Process *) task);
     return (TRUE);
 }
 
@@ -1744,7 +3780,7 @@ no_trans:
         case 'c':  /* ESC [ c - xterm identify */
             /*
              * This should not normally occur here (an App sending this to
-             * an Amiga console).  It will be ignored because reterm uses
+             * an Amiga console). It will be ignored because reterm uses
              * this sequence to detect xterm.
              */
             return;
@@ -2188,7 +4224,7 @@ go_next:
 
 /*
  * app_to_console() takes output written by an application and converts it
- *                  into output suitable for the console device.  If the
+ *                  into output suitable for the console device. If the
  *                  console device is an xterm, then escape sequences are
  *                  translated, as appropriate.
  */
@@ -2310,7 +4346,7 @@ abort_read_queue(glob_t *glob, BOOL do_packet_reply)
             /*
              * We should not get here, though could happen if the
              * child process exited without waiting for reads to
-             * complete.  It's best to not reply, as the message port
+             * complete. It's best to not reply, as the message port
              * may have been deleted.
              */
             warnx("Unknown read queue pkt %d", Pkt->dp_Type);
@@ -2411,7 +4447,7 @@ process_pkt:
             case ACTION_WRITE:
                 if ((glob->cmdline_len != 0) && (glob->stopping == FALSE)) {
                     /*
-                     * Can not process packet at this time.  Once stopping,
+                     * Can not process packet at this time. Once stopping,
                      * the command line will never be completed, so the
                      * write must instead fail below (else the app hangs).
                      */
@@ -2419,7 +4455,14 @@ process_pkt:
                     return;
                 }
 
-                glob->requester_abort_active = FALSE;
+                if (glob->requester_abort_active && (Pkt->dp_Arg3 > 0)) {
+                    /* Program output ends the window control prompt */
+                    if (glob->wk_level == WK_TEXT)
+                        xterm_console_emit(glob, (UBYTE *) "\r\n", 2);
+                    xterm_console_emit(glob, (UBYTE *)
+                                       "Cancel (program output).\r\n", 26);
+                    wk_reset(glob);
+                }
                 glob->child_wtask_mp = Pkt->dp_Port;
 #ifdef DEBUG
                 if (glob->debug_mode == 2) {
@@ -2964,9 +5007,9 @@ tab_completion_prevname(glob_t *glob, int *cursor_adjust)
 
 /*
  * tab_completion_allmatch() will match the command line against directory
- *                           entries on the specified path (lock).  Any
+ *                           entries on the specified path (lock). Any
  *                           entries found will be added to the tab completion
- *                           list.  Each entry will be added with the full path
+ *                           list. Each entry will be added with the full path
  *                           (prepend) and trailing space or slash as expected
  *                           for file or directory.
  */
@@ -3045,7 +5088,7 @@ tab_completion_allmatch(glob_t *glob, BPTR lock, BOOL exec_only, BOOL no_dir,
 
 /*
  * my_assign_from_lock() will acquire the name of an assign, if it's
- *                       the same as the lock provided.  This function
+ *                       the same as the lock provided. This function
  *                       returns TRUE if a match is found.
  */
 static BOOL
@@ -3081,7 +5124,7 @@ my_assign_from_lock(BPTR lock, UBYTE *buf, LONG *buflen)
 
 /*
  * my_name_from_lock() will return the full file path corresponding to the
- *                     specified lock.  If the path may be shortened by an
+ *                     specified lock. If the path may be shortened by an
  *                     active system assign, that assign will be used.
  * For example:
  *     Assign AmiTCP: sys:AmiTCP
@@ -3091,7 +5134,7 @@ my_assign_from_lock(BPTR lock, UBYTE *buf, LONG *buflen)
  *     AmiTCP:bin/ifconfig
  *
  * This function returns a pointer to the buffer containing the file path
- * or NULL.  Note the pointer to the buffer is likely not the same as buf,
+ * or NULL. Note the pointer to the buffer is likely not the same as buf,
  * as buf is filled from the end first.
  */
 static UBYTE *
@@ -3162,9 +5205,9 @@ my_name_from_lock(BPTR lock, UBYTE *buf, LONG buflen)
  *                               the command path of the current child process.
  *
  * The function first searches the child process's current directory, followed
- * by entries in the CLI path, followed by the C: directory.  If the CLI path
+ * by entries in the CLI path, followed by the C: directory. If the CLI path
  * includes the current directory, it will be skipped (will always be searched
- * first).  If the CLI path includes the C: directory, it will be searched
+ * first). If the CLI path includes the C: directory, it will be searched
  * in the CLI path order, and not processed again.
  */
 static void
@@ -3266,7 +5309,7 @@ tab_completion_get_files(glob_t *glob)
  * tab_completion_abs_path() will complete against an absolute path (one
  *                           which has a volume name embedded or starts
  *                           with a ":" indicating the root of the current
- *                           volume.  It will also complete against paths
+ *                           volume. It will also complete against paths
  *                           with an embedded slash "/" meaning the path
  *                           is relative to the current absolute directory.
  */
@@ -3288,9 +5331,9 @@ tab_completion_abs_path(glob_t *glob, BOOL is_command)
  * tab_completion_initiate() will initiate or cycle to the next choice for
  *                           filename completion.
  *
- * The implemented filename completion context-sensitive.  If the cursor
+ * The implemented filename completion context-sensitive. If the cursor
  * is in the first word on the line, then command path completion is
- * attempted.  Otherwise, filename completion is attempted relative to the
+ * attempted. Otherwise, filename completion is attempted relative to the
  * current directory.
  */
 static void
@@ -3417,7 +5460,7 @@ tab_completion_initiate(glob_t *glob, int direction)
     if (glob->cmdline_len + diff > sizeof (glob->cmdline) - 1) {
         /*
          * Completion would not fit in the command line buffer (one byte
-         * is reserved for the newline added on Enter).  Leave the command
+         * is reserved for the newline added on Enter). Leave the command
          * line as is; the next tab will move on to the next name.
          */
         xterm_console_emit(glob, "\a", 1);
@@ -3498,7 +5541,7 @@ finish_initiate:
  * tab_completion_handle() will disable the tab completion buffers if
  *                         the staged flag is not refreshed between calls.
  * This function is called for each character received from the xterm
- * console which is not part of an escape sequence.  Thus, to keep a
+ * console which is not part of an escape sequence. Thus, to keep a
  * tab completion active, the user must only be using the tab, shift tab,
  * or ^D input characters.
  */
@@ -3585,7 +5628,7 @@ reader_handle_arrived_count(glob_t *glob, LONG count)
 
     if (count == 0) {
         /*
-         * Device (e.g. TCP: handler) reported end of file.  Propagate it
+         * Device (e.g. TCP: handler) reported end of file. Propagate it
          * to the application, but track consecutive occurrences separately
          * from user-generated EOF (^\ or telnet EOF) so that an
          * application which consumes each EOF and reads again can not
@@ -3617,7 +5660,7 @@ reader_handle_arrived_count(glob_t *glob, LONG count)
  * send_Read() will queue an asynchronous read to the input device (console).
  *             It performs the equivalent of a Read(), but allows other code
  *             to run while the ACTION_READ remains blocked.
- * This function is called by the reader thread.  The reply packet, when it
+ * This function is called by the reader thread. The reply packet, when it
  * arrives, is handled by the reader thread.
  */
 static void
@@ -3654,7 +5697,7 @@ send_Read(glob_t *glob)
             /*
              * If WaitSelect() reported the socket as readable, but there
              * is no data, then the remote has closed the connection (or
-             * the socket has an error).  recv() will not block in that
+             * the socket has an error). recv() will not block in that
              * case, and is required to observe the EOF (0) or error (-1).
              */
             if (glob->tcp_readable == FALSE)
@@ -3702,7 +5745,7 @@ send_Read(glob_t *glob)
  *              in an attempt to unblock a previously sent asynchronous
  *              ACTION_READ.
  * ViNCEd requires the message port to be the same as that of the
- * asynchronous read.  This code will leak a DOS_STDPKT, which needs
+ * asynchronous read. This code will leak a DOS_STDPKT, which needs
  * to be later absorbed and deallocated by the caller by waiting on
  * the glob->reader_msgport.
  */
@@ -3729,8 +5772,8 @@ send_Abort(glob_t *glob, BPTR fh)
 /*
  * send_Paste() sends a paste character to the specified file handle
  *              to fake user input.
- * This function is used to unblock a pending read at program exit.  It works
- * on Amiga console handler and apparently also AmiTCP's inet-handler.  There
+ * This function is used to unblock a pending read at program exit. It works
+ * on Amiga console handler and apparently also AmiTCP's inet-handler. There
  * is no guarantee it will work with all console handlers.
  */
 static void
@@ -4107,7 +6150,7 @@ cursor_position:
                     /* Console event window resized */
                     sprintf(tbuf, STR_CSI "12;0;0;0;0;0;1;0|");
                     /*
-                     * All values are in decimal.  These are (in order):
+                     * All values are in decimal. These are (in order):
                      *    class (12 = Window resized)
                      *    subclass
                      *    keycode
@@ -4197,7 +6240,7 @@ cursor_position:
  * xterm_cook_app_input() takes raw input from an xterm and processes it
  *                        to provide a suitable command line handler,
  *                        complete with command editing, tab completion,
- *                        and command history.  Only when enter is pressed
+ *                        and command history. Only when enter is pressed
  *                        is the input presented to the Amiga application.
  */
 static void
@@ -4691,7 +6734,7 @@ xterm_csi_cook_app_input(glob_t *glob, UBYTE cmd, const UBYTE *buf, int len)
         case 'r':  // CSI 1 ; 1 ; Pr ; Pc SPACE r - Amiga Window Bounds Report
             /*
              * This should not normally occur here (an xterm answering back
-             * with an Amiga Window Bounds Report.  It will be used to detect
+             * with an Amiga Window Bounds Report. It will be used to detect
              * an Amiga console as present.
              */
             if (((strncmp(buf, "1;1;", 4) == 0) ||
@@ -4731,7 +6774,7 @@ xterm_csi_cook_app_input(glob_t *glob, UBYTE cmd, const UBYTE *buf, int len)
 /*
  * xterm_esc_timer_start() starts a timer to terminate an escape sequence
  *                         should the sequence not be received within an
- *                         acceptable time limit.  This allows reterm to
+ *                         acceptable time limit. This allows reterm to
  *                         differentiate a user ESC press and have that
  *                         sent to the application vs an ESC sequence which
  *                         is to be interpreted.
@@ -4789,8 +6832,8 @@ xterm_timer_occurred(glob_t *glob)
 
 /*
  * This function will process xterm or user input to look like Amiga console
- * output.  This processed output will eventually be read by the Amiga app.
- * The function is called by the reader thread.  Note that this code also
+ * output. This processed output will eventually be read by the Amiga app.
+ * The function is called by the reader thread. Note that this code also
  * executes when connected to an Amiga console.
  */
 static void
@@ -4799,7 +6842,9 @@ reader_process_xterm_to_amiga(glob_t *glob)
     UBYTE cmd;
 
     if (xterm_timer_occurred(glob)) {
-        if (glob->xta_mode == XT_MODE_ESC) {
+        if (wk_esc_timeout(glob)) {
+            /* Lone ESC key press canceled the window control prompt */
+        } else if (glob->xta_mode == XT_MODE_ESC) {
             /* Lone ESC key press (the cooked line editor ignores ESC) */
             if (glob->raw_mode)
                 append_to_app_input(glob, STR_ESC, 1);
@@ -4813,7 +6858,7 @@ reader_process_xterm_to_amiga(glob_t *glob)
 
         /*
          * We could have command line entry or a Windows Bounds Report +
-         * Window Resize Event as the longest input.  Need to be sure
+         * Window Resize Event as the longest input.Need to be sure
          * there will be enough space for either in the processed buffer
          * before proceeding to handle further input.
          */
@@ -4839,6 +6884,11 @@ reader_process_xterm_to_amiga(glob_t *glob)
                     }
                     /* else invalid sequence: lead is dropped */
                 }
+                if (glob->wk_eat_nl) {
+                    glob->wk_eat_nl = FALSE;
+                    if ((cmd == '\n') || (cmd == '\0'))
+                        break;  // End of line which entered gadget text
+                }
                 if (glob->requester_abort_active &&
                     task_window_kill(glob, cmd)) {
                     break;  // Input was absorbed
@@ -4849,7 +6899,7 @@ reader_process_xterm_to_amiga(glob_t *glob)
                 }
                 if (utf8_decoded) {
                     /*
-                     * Decoded character is literal ISO 8859-1 text.  It must
+                     * Decoded character is literal ISO 8859-1 text. It must
                      * not be interpreted below (e.g. 0xff as telnet IAC,
                      * 0x9b as CSI, or 0xc2 as another UTF-8 lead byte).
                      */
@@ -4931,7 +6981,7 @@ pass_through:
                         /*
                          * ESC O x (SS3) is sent by xterm for F1-F4, and for
                          * cursor / Home / End keys in application cursor
-                         * mode.  Handle it as a CSI sequence beginning with
+                         * mode. Handle it as a CSI sequence beginning with
                          * 'O', which the CSI input handlers recognize.
                          */
                         glob->xta_mode = XT_MODE_CSI;
@@ -5140,8 +7190,8 @@ reader_handle_arrived_read(glob_t *glob, struct MsgPort *reply_mp)
 
 /*
  * reader_schedule_timer_request() will schedule a timer request based on
- *     the amount of time requested.  It will store a pointer to this request
- *     (for later cancellation) in the pkt_res2 pointer.  On failure, this
+ *     the amount of time requested. It will store a pointer to this request
+ *     (for later cancellation) in the pkt_res2 pointer. On failure, this
  *     function returns TRUE (non-zero) and sets pkt_res2 to a failure code.
  */
 static BOOL
@@ -5309,7 +7359,7 @@ do_WaitSelect(glob_t *glob, ULONG all_sigmask)
     } else {
         /*
          * No room to receive data, so don't wait for the socket to become
-         * readable (it already is, so that would just spin).  Processing
+         * readable (it already is, so that would just spin). Processing
          * resumes when the application consumes input (signal) or on the
          * timeout below.
          */
@@ -5373,6 +7423,7 @@ reader_thread(register char *arg, register long len)
     LONG  wake_sigbit;
     int   stop_count = 0;
     struct DateStamp stop_ds;
+    BOOL             sent_break = FALSE;  // Break sent to application at stop
     LONG  tcp_read_sigbit = -1;
     ULONG reader_sigmask;
     ULONG app_cons_sigmask;
@@ -5476,7 +7527,7 @@ reader_thread(register char *arg, register long len)
         {
             /*
              * Keepalive allows a dead peer (no FIN/RST) to eventually be
-             * detected.  Non-blocking I/O allows a stalled send() to be
+             * detected. Non-blocking I/O allows a stalled send() to be
              * interrupted when reterm is stopping.
              */
             LONG one = 1;
@@ -5589,6 +7640,7 @@ break;
 
         /* 5. Process arrived data in read buffer to proc buffer */
         reader_process_xterm_to_amiga(glob);
+        (void) task_window_collect(glob, 0);  // Replied gadget/menu messages
 
         /* 6. Handle arrived console messages from application */
         if (qtt_count == 0) {
@@ -5622,16 +7674,17 @@ break;
 
     /*
      * The application may still hold file handles which reference
-     * glob->app_cons_msgport.  For a grace period, that port is serviced
+     * glob->app_cons_msgport. For a grace period, that port is serviced
      * (failing all I/O) so that the application sees EOF and exits, as an
-     * idle shell will.  Send break signals so that applications which are
-     * not doing console I/O will also notice and exit.  If the application
+     * idle shell will. Send break signals so that applications which are
+     * not doing console I/O will also notice and exit. If the application
      * is still using the console after the grace period, the session
      * detaches from it (see below).
      */
     if (glob->child_process_alive && session_app_active(glob)) {
         /* Not already closing its console (where ACTION_END stops) */
         signal_child(glob, SIGBREAKF_CTRL_C | SIGBREAKF_CTRL_D);
+        sent_break = TRUE;
     }
     DateStamp(&stop_ds);
     while (session_app_active(glob) || glob->runner_thread_alive) {
@@ -5655,14 +7708,18 @@ break;
         /*
          * The application is busy elsewhere (such as waiting on a requester
          * or a long-running command), or is an application such as an
-         * editor which does not exit on EOF.  Detach from it: the port is
+         * editor which does not exit on EOF. Detach from it: the port is
          * left abandoned (below), so the application blocks at its next
          * console I/O rather than spinning on failed I/O, and it may later
-         * be reattached with "reterm -A".  This also frees the session.
+         * be reattached with "reterm -A". This also frees the session.
          * The port can not be deleted, as the application still uses it.
          */
         DPRINT1("reader stop: detaching from app");
         break;
+    }
+    if (sent_break && session_app_active(glob)) {
+        /* Detaching: the application did not act on the break; withdraw it */
+        unsignal_child(glob, SIGBREAKF_CTRL_C | SIGBREAKF_CTRL_D);
     }
     DPRINT1("reader stop: open_count=%d runner=%d waited=%d",
             glob->open_count, glob->runner_thread_alive, stop_count);
@@ -5684,7 +7741,7 @@ break;
                 /*
                  * Sending a Paste into the handler to clear a pending read
                  * works with the AmigaOS 3.1 CON: and with AmiTCP 3.x TCP:
-                 * handlers.  It might not work with other handlers.
+                 * handlers. It might not work with other handlers.
                  */
                 send_Paste(glob->reader_IFH, "\n", 1);
 
@@ -5764,6 +7821,16 @@ fail_exit:
         DeleteMsgPort(timer_mp);
     if (xterm_timer_mp != NULL)
         DeleteMsgPort(xterm_timer_mp);
+    if (glob->wk_reply_mp != NULL) {
+        if (task_window_collect(glob, 2 * TICKS_PER_SECOND) == 0) {
+            DeleteMsgPort(glob->wk_reply_mp);
+        } else {
+            /* Application never replied: leak the port and messages */
+            glob->wk_reply_mp->mp_Flags   = PA_IGNORE;
+            glob->wk_reply_mp->mp_SigTask = NULL;
+        }
+        glob->wk_reply_mp = NULL;
+    }
     if (glob->adopted) {
         /*
          * An adopted port is never deleted, as file handles which are not
@@ -5791,7 +7858,7 @@ fail_exit:
         if ((glob->open_count > 0) || glob->runner_thread_alive) {
             /*
              * The application still has file handles referencing this
-             * port.  Deleting it would cause a crash or hang the next time
+             * port. Deleting it would cause a crash or hang the next time
              * the application performs console I/O, so it is leaked.
              * Packets sent to it will no longer signal this (exiting) task.
              */
@@ -5819,7 +7886,7 @@ fail_exit:
     tab_completion_wipe(glob);
     /*
      * ACTION_DISK_INFO gave the application pointers to the fake window
-     * (id_VolumeNode) and to the console unit in this glob (id_InUse).  If
+     * (id_VolumeNode) and to the console unit in this glob (id_InUse). If
      * the application is still running, it may use them at any time (an
      * editor may restore the window title when it exits), so the window
      * is left open and the glob is not freed.
@@ -6010,6 +8077,8 @@ glob_init(glob_t **glob_p, glob_t *glob_proto)
 finish_init:
     strcpy(glob->fake_title, "Reterm");
     glob->magic        = GLOB_MAGIC;
+    glob->wk_reply_mp    = NULL;
+    glob->wk_outstanding = 0;
     glob->kept_unlinked = FALSE;
     glob->kept_released = FALSE;
     glob->kept_prev    = NULL;
@@ -6052,7 +8121,7 @@ handle_connection(glob_t *glob_p, char *runner_cmd)
     /* Start the reader thread first so it can begin waiting for input */
     CreateNewProcTags(NP_Entry, (ULONG) reader_thread,
                       NP_Name, (ULONG) reader_name,
-                      NP_StackSize, 1600,  // Minimum stack for printf(), etc
+                      NP_StackSize, 8192,  // ^C prompt runs here (vsnprintf)
                       NP_ExitData, (ULONG) glob,
                       TAG_END);
 
@@ -6252,6 +8321,11 @@ main(int argc, char *argv[])
             err(EXIT_FAILURE, "Failed to open %s", "intuition.library");
         }
     }
+    /* Optional: used only to recognize gadget labels drawn as pixels */
+    if (GfxBase == NULL)
+        GfxBase = (struct GfxBase *) OpenLibrary("graphics.library", 36);
+    if (LayersBase == NULL)
+        LayersBase = OpenLibrary("layers.library", 36);
 
     /* Initialize the global data */
     glob_init(&glob, NULL);
@@ -6528,7 +8602,7 @@ handle_capture:
                 LONG error = Errno();
                 warnx("socket accept failed: %d", error);
                 /*
-                 * A break (EINTR) or repeated failure stops reterm.  Other
+                 * A break (EINTR) or repeated failure stops reterm. Other
                  * failures (such as a client which reset the connection
                  * before it was accepted) are transient.
                  */
@@ -6589,9 +8663,9 @@ no_task_to_run:
         handle_signals(glob);
         /*
          * Reader threads run code in this program, so they must be gone
-         * before reterm exits.  A reader thread does not exit until its
+         * before reterm exits. A reader thread does not exit until its
          * application has closed the console, because the application
-         * would otherwise hang at its next console I/O.  That may take a
+         * would otherwise hang at its next console I/O. That may take a
          * long time (for example, a requester which nobody has answered),
          * so the user may force an exit with a second break.
          */
@@ -6645,6 +8719,14 @@ fail_exit:
     if (IntuitionBase != NULL) {
         CloseLibrary(IntuitionBase);
         IntuitionBase = NULL;
+    }
+    if (LayersBase != NULL) {
+        CloseLibrary(LayersBase);
+        LayersBase = NULL;
+    }
+    if (GfxBase != NULL) {
+        CloseLibrary((struct Library *) GfxBase);
+        GfxBase = NULL;
     }
     if (SocketBase != NULL) {
         CloseLibrary(SocketBase);
